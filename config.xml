@@ -1,6 +1,6 @@
-<?xml version="1.0" encoding="UTF-8"?>
 <config>
-  <storage>
-    <dataDir>data</dataDir>
-  </storage>
+    <DATA_DIR>./data</DATA_DIR>
+    <COMPRESSION>SNAPPY</COMPRESSION>
+    <ALLOW_DELETE>false</ALLOW_DELETE>
+    <ALLOW_PUT>false</ALLOW_PUT>
 </config>

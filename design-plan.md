@@ -11,9 +11,10 @@
 3. [REQ-002: RESTful API 微服务架构](#3-req-002-微服务架构使用-restful-api-接口)
 4. [REQ-003: 灵活数据类型支持](#4-req-003-存储数据类型灵活支持拓展)
 5. [REQ-004: 依赖关系](#5-req-004-依赖关系)
-6. [技术架构设计](#6-技术架构设计)
-7. [实施计划](#7-实施计划)
-8. [风险与注意事项](#8-风险与注意事项)
+6. [REQ-005: 配置管理](#6-req-005-配置管理)
+7. [技术架构设计](#7-技术架构设计)
+8. [实施计划](#8-实施计划)
+9. [风险与注意事项](#9-风险与注意事项)
 
 ---
 
@@ -214,23 +215,22 @@ class SchemaManager:
         """列出所有可用的 schema"""
 ```
 
-#### 2.5.2 Schema 注册流程
+#### 2.5.2 Schema 加载流程
+
+**重要说明**：数据类型不支持动态扩展，新增数据类型需要通过版本升级实现。
 
 **步骤**:
 1. 在 `schemas/` 目录创建 JSON 定义文件（如 `stock_5min_v1.json`）
-2. SchemaManager 启动时自动加载所有 schema
+2. SchemaManager 启动时加载所有 schema（启动时确定，运行时不可变）
 3. 数据写入前验证 schema
 4. 数据读取时应用 schema
 
-**示例**: 注册新数据类型
-```bash
-# 1. 创建 schema 文件
-vim schemas/new_datatype_v1.json
-
-# 2. 重启服务（自动加载）
-# 3. 验证
-curl http://localhost:8080/api/v1/schemas
-```
+**新增数据类型的流程**（版本升级）：
+1. 创建新的 schema JSON 文件
+2. 如需自定义处理逻辑，修改代码
+3. 更新 VERSION 文件
+4. 构建并发布新版本 Docker 镜像
+5. 重新部署服务
 
 ### 2.6 索引模块设计（已调整）
 
@@ -473,36 +473,156 @@ class StorageManager:
     def __init__(self, compression: str = 'SNAPPY'):
         """初始化存储管理器"""
         self.compression = compression
-        
+
+    # ---------- 文件锁机制（进程安全，REQ-001）----------
+    def _get_lock_path(self, file_path: str) -> str:
+        """返回对应的锁文件路径（与数据文件同目录，.lock 后缀）"""
+        return file_path + '.lock'
+
+    def _acquire_write_lock(self, file_path: str):
+        """获取写锁（排他锁 LOCK_EX），阻塞直到获取成功
+        返回锁文件 fd，调用方需在 finally 中调用 _release_lock(fd)
+        """
+        import fcntl, os
+        lock_path = self._get_lock_path(file_path)
+        lock_fd = open(lock_path, 'w')
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        return lock_fd
+
+    def _acquire_read_lock(self, file_path: str):
+        """获取读锁（共享锁 LOCK_SH），如有写锁则阻塞等待
+        返回锁文件 fd，调用方需在 finally 中调用 _release_lock(fd)
+        """
+        import fcntl, os
+        lock_path = self._get_lock_path(file_path)
+        if not os.path.exists(lock_path):
+            open(lock_path, 'w').close()
+        lock_fd = open(lock_path, 'r')
+        fcntl.flock(lock_fd, fcntl.LOCK_SH)
+        return lock_fd
+
+    def _release_lock(self, lock_fd):
+        """释放锁（LOCK_UN）并关闭 fd"""
+        import fcntl
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+
+    # ---------- 读写删接口（含锁）----------
     def write_parquet(self, data: pd.DataFrame, file_path: str,
                       schema: pa.Schema = None, mode: str = 'append') -> str:
-        """写入 Parquet 文件"""
-        # 如果 mode='append' 且文件存在，读取后合并
-        # 如果 mode='overwrite'，直接覆盖
-        
+        """写入 Parquet 文件（内含写锁）"""
+        lock_fd = None
+        try:
+            lock_fd = self._acquire_write_lock(file_path)
+            # ... 原有写入逻辑（append/overwrite）...
+        finally:
+            if lock_fd:
+                self._release_lock(lock_fd)
+
     def read_parquet(self, file_paths: List[str],
                      columns: List[str] = None) -> pd.DataFrame:
-        """读取 Parquet 文件"""
-        # 读取单个或多个文件
-        # 如果指定 columns，只读取指定列
-        
+        """读取 Parquet 文件（内含读锁）"""
+        lock_fds = []
+        try:
+            for fp in file_paths:
+                if os.path.exists(fp):
+                    lock_fds.append(self._acquire_read_lock(fp))
+            # ... 原有读取逻辑 ...
+        finally:
+            for fd in lock_fds:
+                self._release_lock(fd)
+
     def delete_parquet(self, file_path: str) -> bool:
-        """删除 Parquet 文件"""
-        
+        """删除 Parquet 文件（内含写锁）"""
+        lock_fd = None
+        try:
+            lock_fd = self._acquire_write_lock(file_path)
+            result = os.remove(file_path)
+            lock_path = self._get_lock_path(file_path)
+            if os.path.exists(lock_path):
+                os.remove(lock_path)
+            return result
+        finally:
+            if lock_fd:
+                self._release_lock(lock_fd)
+
     def file_exists(self, file_path: str) -> bool:
-        """检查文件是否存在"""
-        
+        """检查文件是否存在（无需加锁，只检查路径）"""
+        return os.path.exists(file_path)
+
     def get_file_metadata(self, file_path: str) -> dict:
-        """获取文件元数据（行数、大小等）"""
+        """获取文件元数据（内含读锁）"""
+        lock_fd = None
+        try:
+            if os.path.exists(file_path):
+                lock_fd = self._acquire_read_lock(file_path)
+            # ... 获取行数、文件大小 ...
+        finally:
+            if lock_fd:
+                self._release_lock(lock_fd)
 ```
 
-### 2.8 实施步骤
+#### 2.8.2 进程安全设计（文件锁机制）
+
+**需求来源**：REQ-001 新增 — 数据存储进程安全
+
+**设计要求**：
+1. 同时只能有一个写入操作（写锁排他）
+2. 文件被写入时，阻塞读取（写锁期间读锁等待）
+3. 多个读取可以并发（读锁共享）
+4. 访问文件时必须获得读取锁或写入锁
+
+**实现方案**：使用 `fcntl.flock` 文件级建议锁（Linux/macOS 通用）
+
+| 操作 | 锁类型 | 行为 |
+|------|--------|------|
+| 写入 / 删除 | 排他锁 `LOCK_EX` | 阻塞直到获取，期间其他进程无法读或写 |
+| 读取 | 共享锁 `LOCK_SH` | 可多个并发，但需等待写锁释放 |
+| 释放 | `LOCK_UN` | 释放锁，唤醒等待进程 |
+
+**锁文件规则**：
+- 每个数据文件对应一个锁文件：`<data_file>.lock`
+- 锁文件与数据文件同目录，可随数据文件一起删除
+- `fcntl.flock` 是建议锁，所有访问方都需遵守锁协议
+
+**注意事项**：
+- Windows 不支持 `fcntl`，跨平台可用 `portalocker` 库（可选依赖）
+- 同一进程内多线程并发，需用 `threading.Lock` 额外保护（可选）
+
+#### 2.8.3 存储管理器实施步骤
+
+**步骤 1: 实现存储管理器基础框架** (`storage_manager.py`)
+1. 实现 `__init__` 方法（初始化压缩算法）
+2. 实现 `write_parquet` 方法（写入 Parquet 文件，支持 append/overwrite 模式）
+3. 实现 `read_parquet` 方法（读取 Parquet 文件，支持多文件、列过滤）
+4. 实现 `delete_parquet` 方法（删除 Parquet 文件）
+5. 实现 `file_exists` 方法（检查文件是否存在，无需加锁）
+6. 实现 `get_file_metadata` 方法（获取文件元数据，含读锁）
+
+**步骤 2: 实现文件锁机制**
+1. 实现 `_get_lock_path` 方法（生成 `.lock` 文件路径）
+2. 实现 `_acquire_write_lock` 方法（获取排他写锁，阻塞）
+3. 实现 `_acquire_read_lock` 方法（获取共享读锁，等待写锁释放）
+4. 实现 `_release_lock` 方法（释放锁并关闭 fd）
+5. 在 `write_parquet`/`read_parquet`/`delete_parquet`/`get_file_metadata` 中集成锁机制
+
+**步骤 3: 编写单元测试** (`test_storage_manager.py`)
+1. 测试写入和读取（含 schema 验证）
+2. 测试追加模式（append）
+3. 测试覆盖模式（overwrite）
+4. 测试删除功能
+5. 测试元数据获取
+6. 测试锁机制（模拟多进程访问，验证写锁排他、读锁共享）
+
+---
+
+### 2.9 项目级实施步骤
 
 **阶段 1: 基础框架搭建**
 1. 创建项目结构
 2. 实现 SchemaManager
-3. 实现 IndexManager (JSON 版本)
-4. 实现 StorageManager
+3. 实现 IndexManager
+4. 实现 StorageManager（含文件锁机制）
 
 **阶段 2: 功能完善**
 1. 支持数据分区和分片
@@ -561,33 +681,57 @@ app/
     └── data_interface.yaml
 ```
 
-### 3.3 API 设计
+### 3.3 API 设计（已更新）
 
-#### 3.3.1 RESTful API 端点设计
+#### 3.3.0 配置开关
 
-**资源**: `data`
+**设计原则**：修改(PUT)和删除(DELETE)操作通过配置开关控制是否允许。
+
+**配置项** (`app/config.py`):
+```python
+class Config:
+    # 是否允许修改数据（PUT 操作）
+    ALLOW_PUT = False  # 默认关闭
+
+    # 是否允许删除数据（DELETE 操作）
+    ALLOW_DELETE = False  # 默认关闭
+
+    # 也可通过环境变量覆盖
+    # DATACENTER_ALLOW_PUT=true
+    # DATACENTER_ALLOW_DELETE=false
+```
+
+**开关行为**:
+- 开关关闭时，对应端点返回 `405 Method Not Allowed`
+- 响应体：`{"success": false, "error": "PUT operation is disabled by configuration"}`
+- 开关可通过环境变量运行时覆盖，无需重新部署
+
+#### 3.3.1 RESTful API 端点设计（已更新）
+
+**资源**: `data/{data_type}`
+
+**设计说明**：API 路径中体现数据类型，不再通过请求体传递。
 
 **端点列表**:
 
-| HTTP 方法 | 端点 | 功能 | 请求体 | 响应 |
-|-----------|------|------|--------|------|
-| POST | `/api/v1/data` | 写入数据 | JSON/Parquet | 写入结果 |
-| GET | `/api/v1/data` | 查询数据 | Query 参数 | JSON/Parquet |
-| PUT | `/api/v1/data` | 更新数据 | JSON/Parquet | 更新结果 |
-| DELETE | `/api/v1/data` | 删除数据 | Query 参数 | 删除结果 |
-| GET | `/api/v1/data/schemas` | 列出所有 schema | - | JSON |
-| GET | `/api/v1/data/stats` | 获取存储统计 | - | JSON |
+| HTTP 方法 | 端点 | 功能 | 请求体 | 响应 | 开关控制 |
+|-----------|------|------|--------|------|----------|
+| POST | `/api/v1/data/{data_type}` | 写入数据 | JSON | 写入结果 | - |
+| GET | `/api/v1/data/{data_type}` | 查询数据 | Query 参数 | JSON | - |
+| PUT | `/api/v1/data/{data_type}` | 更新数据 | JSON | 更新结果 | ALLOW_PUT |
+| DELETE | `/api/v1/data/{data_type}` | 删除数据 | Query 参数 | 删除结果 | ALLOW_DELETE |
+| GET | `/api/v1/data/{data_type}/schemas` | 列出 schema | - | JSON | - |
+| GET | `/api/v1/data/{data_type}/stats` | 存储统计 | - | JSON | - |
 
 #### 3.3.2 API 详细说明
 
 **1. 写入数据**
 
 ```
-POST /api/v1/data
+POST /api/v1/data/stock
 Content-Type: application/json
 
 {
-  "data_type": "stock",
   "granularity": "5min",
   "date": "2026-05-17",
   "schema": "stock_5min_v1",
@@ -608,12 +752,15 @@ Content-Type: application/json
 }
 ```
 
+> **变更说明**：data_type 从请求体移到 URL 路径中（`/api/v1/data/stock`）
+
 **响应**:
 ```json
 {
   "success": true,
   "message": "Data written successfully",
   "details": {
+    "data_type": "stock",
     "rows_written": 1,
     "file_path": "data/stock/5min/2026/05/2026-05-17.parquet",
     "schema": "stock_5min_v1"
@@ -624,8 +771,10 @@ Content-Type: application/json
 **2. 查询数据**
 
 ```
-GET /api/v1/data?data_type=stock&granularity=5min&start_date=2026-05-17&end_date=2026-05-18&market=XHKG&codes=00700,00701
+GET /api/v1/data/stock?granularity=5min&start_date=2026-05-17&end_date=2026-05-18&market=XHKG&codes=00700,00701
 ```
+
+> **变更说明**：data_type 从 Query 参数移到 URL 路径中
 
 **响应**:
 ```json
@@ -633,6 +782,7 @@ GET /api/v1/data?data_type=stock&granularity=5min&start_date=2026-05-17&end_date
   "success": true,
   "data": [...],
   "metadata": {
+    "data_type": "stock",
     "total_rows": 96,
     "files_read": 2,
     "schema": "stock_5min_v1"
@@ -640,16 +790,54 @@ GET /api/v1/data?data_type=stock&granularity=5min&start_date=2026-05-17&end_date
 }
 ```
 
-**3. 列出所有 schema**
+**3. 更新数据**（受 ALLOW_PUT 开关控制）
 
 ```
-GET /api/v1/data/schemas
+PUT /api/v1/data/stock
+Content-Type: application/json
+
+{
+  "granularity": "5min",
+  "date": "2026-05-17",
+  "data": [...]
+}
+```
+
+**开关关闭时响应**:
+```json
+{
+  "success": false,
+  "error": "PUT operation is disabled by configuration"
+}
+HTTP 405
+```
+
+**4. 删除数据**（受 ALLOW_DELETE 开关控制）
+
+```
+DELETE /api/v1/data/stock?granularity=5min&start_date=2026-05-17&end_date=2026-05-17
+```
+
+**开关关闭时响应**:
+```json
+{
+  "success": false,
+  "error": "DELETE operation is disabled by configuration"
+}
+HTTP 405
+```
+
+**5. 列出 schema**
+
+```
+GET /api/v1/data/stock/schemas
 ```
 
 **响应**:
 ```json
 {
   "success": true,
+  "data_type": "stock",
   "schemas": [
     {
       "name": "stock_5min",
@@ -660,7 +848,13 @@ GET /api/v1/data/schemas
 }
 ```
 
-### 3.4 Interface 定义
+**6. 存储统计**
+
+```
+GET /api/v1/data/stock/stats
+```
+
+### 3.4 Interface 定义（已更新）
 
 #### 3.4.1 创建 interface 文件
 
@@ -669,93 +863,169 @@ GET /api/v1/data/schemas
 ```yaml
 api_version: v1
 endpoints:
-  - path: /api/v1/data
-    methods: [POST, GET, PUT, DELETE]
+  - path: /api/v1/data/<data_type>
+    methods: [POST, GET]
     handler: data_handler.DataHandler
     description: "数据写入和查询接口"
-    
-  - path: /api/v1/data/schemas
+
+  - path: /api/v1/data/<data_type>
+    methods: [PUT, DELETE]
+    handler: data_handler.DataHandler
+    config_gate:
+      PUT: ALLOW_PUT
+      DELETE: ALLOW_DELETE
+    description: "数据修改和删除接口（受配置开关控制）"
+
+  - path: /api/v1/data/<data_type>/schemas
     methods: [GET]
     handler: data_handler.SchemaHandler
-    description: "Schema 管理接口"
-    
-  - path: /api/v1/data/stats
+    description: "Schema 查询接口"
+
+  - path: /api/v1/data/<data_type>/stats
     methods: [GET]
     handler: data_handler.StatsHandler
     description: "存储统计接口"
 ```
 
-### 3.5 Handler 实现
+### 3.5 Handler 实现（已更新）
 
 #### 3.5.1 数据处理器 (`handlers/data_handler.py`)
 
 ```python
 from flask import request, jsonify
 import pandas as pd
-from app.storage_manager import StorageManager
+from app.data_processor import DataProcessor
 from app.schema_manager import SchemaManager
+from app.config import Config
 
 class DataHandler:
-    def __init__(self, storage_manager: StorageManager, 
-                 schema_manager: SchemaManager):
-        self.storage_manager = storage_manager
+    def __init__(self, data_processor: DataProcessor,
+                 schema_manager: SchemaManager,
+                 config: Config):
+        self.data_processor = data_processor
         self.schema_manager = schema_manager
-    
-    def post(self):
+        self.config = config
+
+    def post(self, data_type: str):
         """写入数据"""
         try:
             payload = request.json
-            data_type = payload['data_type']
             granularity = payload['granularity']
             date = payload['date']
             data = payload['data']
-            
-            # 转换为 DataFrame
+
             df = pd.DataFrame(data)
-            
-            # 写入数据
-            file_path = self.storage_manager.write_data(
+
+            result = self.data_processor.write_data(
                 df, data_type, granularity, date
             )
-            
+
             return jsonify({
                 "success": True,
                 "message": "Data written successfully",
                 "details": {
-                    "rows_written": len(df),
-                    "file_path": file_path
+                    "data_type": data_type,
+                    "rows_written": result['rows_written'],
+                    "file_path": result['file_path']
                 }
             }), 200
-            
+
         except Exception as e:
             return jsonify({
                 "success": False,
                 "error": str(e)
             }), 400
-    
-    def get(self):
+
+    def get(self, data_type: str):
         """查询数据"""
         try:
-            data_type = request.args.get('data_type')
             granularity = request.args.get('granularity')
             start_date = request.args.get('start_date')
             end_date = request.args.get('end_date')
             market = request.args.get('market')
-            
-            # 读取数据
-            df = self.storage_manager.read_data(
-                data_type, granularity, 
-                start_date, end_date, market
+            codes = request.args.get('codes', '').split(',') if request.args.get('codes') else None
+
+            df = self.data_processor.read_data(
+                data_type, granularity,
+                start_date, end_date, market, codes
             )
-            
+
             return jsonify({
                 "success": True,
                 "data": df.to_dict('records'),
                 "metadata": {
+                    "data_type": data_type,
                     "total_rows": len(df)
                 }
             }), 200
-            
+
+        except Exception as e:
+            return jsonify({
+                "success": False,
+                "error": str(e)
+            }), 400
+
+    def put(self, data_type: str):
+        """更新数据（受 ALLOW_PUT 开关控制）"""
+        if not self.config.ALLOW_PUT:
+            return jsonify({
+                "success": False,
+                "error": "PUT operation is disabled by configuration"
+            }), 405
+
+        try:
+            payload = request.json
+            granularity = payload['granularity']
+            date = payload['date']
+            data = payload['data']
+
+            df = pd.DataFrame(data)
+            result = self.data_processor.write_data(
+                df, data_type, granularity, date, mode='overwrite'
+            )
+
+            return jsonify({
+                "success": True,
+                "message": "Data updated successfully",
+                "details": {
+                    "data_type": data_type,
+                    "rows_written": result['rows_written'],
+                    "file_path": result['file_path']
+                }
+            }), 200
+
+        except Exception as e:
+            return jsonify({
+                "success": False,
+                "error": str(e)
+            }), 400
+
+    def delete(self, data_type: str):
+        """删除数据（受 ALLOW_DELETE 开关控制）"""
+        if not self.config.ALLOW_DELETE:
+            return jsonify({
+                "success": False,
+                "error": "DELETE operation is disabled by configuration"
+            }), 405
+
+        try:
+            granularity = request.args.get('granularity')
+            start_date = request.args.get('start_date')
+            end_date = request.args.get('end_date')
+
+            result = self.data_processor.delete_data(
+                data_type, granularity, start_date, end_date
+            )
+
+            return jsonify({
+                "success": True,
+                "message": "Data deleted successfully",
+                "details": {
+                    "data_type": data_type,
+                    "files_deleted": result['files_deleted']
+                }
+            }), 200
+
         except Exception as e:
             return jsonify({
                 "success": False,
@@ -842,16 +1112,19 @@ paths:
 
 **字段**: 日期、股票代码、市场、股票名称、时间、开盘、收盘、最高、最低、成交量
 
-### 4.2 Schema 注册机制
+**重要说明**：「灵活」的含义是 schema 支持多版本（v1/v2），数据类型列表在版本发布时确定。
+新增数据类型需要修改代码 + 发布新版本，不支持运行时动态注册。
 
-#### 4.2.1 Schema 注册流程
+### 4.2 Schema 加载机制（非动态注册）
+
+#### 4.2.1 Schema 加载流程
 
 **步骤**:
 1. 定义 schema JSON 文件
 2. 放置到 `schemas/` 目录
-3. 重启服务或热加载
-4. Schema 自动注册到 SchemaManager
-5. API 自动支持新数据类型
+3. 服务启动时一次性加载
+4. Schema 注册到 SchemaManager（运行时不可变）
+5. API 支持已注册的数据类型
 
 **示例**: 注册股票 5分钟数据 schema
 
@@ -1012,30 +1285,29 @@ paths:
 }
 ```
 
-#### 4.3.2 动态加载机制
+#### 4.3.2 Schema 加载机制
 
-**SchemaManager 加载逻辑**:
+**SchemaManager 加载逻辑**（启动时一次性加载，运行时不可变）：
 ```python
 def load_all_schemas(self):
-    """加载所有 schema 文件"""
+    """启动时加载所有 schema 文件（一次性加载，运行时不可变）"""
     schema_files = glob.glob(os.path.join(self.schemas_dir, "*.json"))
-    
+
     for file_path in schema_files:
         with open(file_path, 'r') as f:
             schema_def = json.load(f)
-            
+
         data_type = schema_def['name']
         version = schema_def['version']
-        
+
         # 注册 schema
         self.schemas[(data_type, version)] = schema_def
-        
+
         # 建立最新版本索引
         if data_type not in self.latest_versions:
             self.latest_versions[data_type] = version
-        else:
-            # 比较版本号，更新最新版本
-            pass
+
+# 注意：不提供 add_schema() / remove_schema() 等运行时修改方法
 ```
 
 ### 4.4 实施步骤
@@ -1050,10 +1322,10 @@ def load_all_schemas(self):
 2. 实现版本兼容性检查
 3. 测试版本演进场景
 
-**阶段 3: 扩展支持**
-1. 添加更多数据类型（日线、Tick等）
-2. 实现动态加载
-3. 文档和示例
+**阶段 3: 类型扩展**（通过版本升级）
+1. 添加新数据类型时，修改代码 + schema
+2. 更新 VERSION
+3. 构建并发布新版本
 
 ---
 
@@ -1225,9 +1497,202 @@ class DynamicLoader:
 
 ---
 
-## 6. 技术架构设计
+## 6. REQ-005: 配置管理
 
-### 6.1 系统架构图（已更新）
+### 6.1 需求分析
+
+**需求描述**:
+- 实现配置管理模块
+- 目前需要管理的配置有：
+  - `allow_delete`：全局控制数据删除操作
+  - `allow_modify`：全局控制数据修改操作
+
+**设计目标**:
+- 配置集中管理，避免散落在代码各处
+- 支持环境变量覆盖（便于容器化部署）
+- 配置项有明确默认值，安全优先（默认关闭危险操作）
+
+### 6.2 配置项设计
+
+**配置优先级（从高到低）**：
+1. 环境变量（`DATACENTER_*`）
+2. XML 配置文件（`config.xml` 或 `DATACENTER_CONFIG_FILE` 指定路径）
+3. 代码默认值
+
+| 配置项 | 类型 | 默认值 | 环境变量 | XML 标签 | 说明 |
+|--------|------|--------|----------|----------|------|
+| `ALLOW_DELETE` | bool | `False` | `DATACENTER_ALLOW_DELETE` | `<ALLOW_DELETE>` | 全局控制 DELETE 操作 |
+| `ALLOW_PUT` | bool | `False` | `DATACENTER_ALLOW_PUT` | `<ALLOW_PUT>` | 全局控制 PUT 操作 |
+| `DATA_DIR` | str | `./data` | `DATACENTER_DATA_DIR` | `<DATA_DIR>` | 数据存储根目录 |
+| `COMPRESSION` | str | `SNAPPY` | `DATACENTER_COMPRESSION` | `<COMPRESSION>` | Parquet 压缩算法 |
+| `CONFIG_FILE` | str | `config.xml` | `DATACENTER_CONFIG_FILE` | — | XML 配置文件路径 |
+
+**XML 配置文件格式**（`config.xml`）：
+```xml
+<config>
+    <DATA_DIR>./data</DATA_DIR>
+    <COMPRESSION>SNAPPY</COMPRESSION>
+    <ALLOW_DELETE>false</ALLOW_DELETE>
+    <ALLOW_PUT>false</ALLOW_PUT>
+</config>
+```
+
+> 注：环境变量优先级高于 XML 文件；XML 文件不存在时不报错，使用默认值。
+
+### 6.3 配置管理实现（`app/config.py`）
+
+**配置加载顺序**（`__init__` 内按顺序执行）：
+1. 加载代码默认值
+2. 加载 XML 配置文件（若存在，`CONFIG_FILE` 或默认 `config.xml`）
+3. 加载环境变量（覆盖 XML 中的值）
+4. 应用运行时 override（`**overrides`）
+
+```python
+import os
+import xml.etree.ElementTree as ET
+from typing import Any, Dict
+
+
+class Config:
+    """集中式配置管理
+    
+    优先级（从高到低）：
+    1. 运行时 override（`**overrides`）
+    2. 环境变量（`DATACENTER_*`）
+    3. XML 配置文件（`config.xml`）
+    4. 代码默认值
+    """
+
+    def __init__(self, **overrides: Any) -> None:
+        # 1. 代码默认值
+        self.DATA_DIR: str = './data'
+        self.COMPRESSION: str = 'SNAPPY'
+        self.ALLOW_DELETE: bool = False
+        self.ALLOW_PUT: bool = False
+
+        # 2. 加载 XML 配置文件
+        config_file = os.getenv('DATACENTER_CONFIG_FILE', 'config.xml')
+        self._load_xml_config(config_file)
+
+        # 3. 加载环境变量（优先级高于 XML）
+        self.DATA_DIR = os.getenv('DATACENTER_DATA_DIR', self.DATA_DIR)
+        self.COMPRESSION = os.getenv('DATACENTER_COMPRESSION', self.COMPRESSION)
+        allow_delete_env = os.getenv('DATACENTER_ALLOW_DELETE')
+        if allow_delete_env is not None:
+            self.ALLOW_DELETE = allow_delete_env.lower() == 'true'
+        allow_put_env = os.getenv('DATACENTER_ALLOW_PUT')
+        if allow_put_env is not None:
+            self.ALLOW_PUT = allow_put_env.lower() == 'true'
+
+        # 4. 运行时 override（最高优先级）
+        for key, value in overrides.items():
+            if hasattr(self, key):
+                setattr(self, key, value)
+
+    def _load_xml_config(self, config_file: str) -> None:
+        """从 XML 文件加载配置（文件不存在时跳过）"""
+        if not os.path.exists(config_file):
+            return
+        try:
+            tree = ET.parse(config_file)
+            root = tree.getroot()
+            for elem in root:
+                if elem.tag == 'DATA_DIR':
+                    self.DATA_DIR = elem.text or self.DATA_DIR
+                elif elem.tag == 'COMPRESSION':
+                    self.COMPRESSION = elem.text or self.COMPRESSION
+                elif elem.tag == 'ALLOW_DELETE':
+                    self.ALLOW_DELETE = (elem.text or 'false').lower() == 'true'
+                elif elem.tag == 'ALLOW_PUT':
+                    self.ALLOW_PUT = (elem.text or 'false').lower() == 'true'
+        except Exception:
+            # XML 解析失败时不报错，继续使用已有配置
+            pass
+
+    def to_dict(self) -> Dict[str, Any]:
+        """导出当前配置（用于调试/健康检查）"""
+        return {
+            'DATA_DIR': self.DATA_DIR,
+            'COMPRESSION': self.COMPRESSION,
+            'ALLOW_DELETE': self.ALLOW_DELETE,
+            'ALLOW_PUT': self.ALLOW_PUT,
+        }
+```
+
+### 6.4 Handler 中的开关检查逻辑
+
+配置开关在 Handler 层统一检查，不分散到 StorageManager 或 DataProcessor。
+
+```python
+# handlers/data_handler.py
+
+class DataHandler:
+    def __init__(self, data_processor, schema_manager, config):
+        self.data_processor = data_processor
+        self.schema_manager = schema_manager
+        self.config = config
+
+    def put(self, data_type: str):
+        """修改数据 - 受 ALLOW_PUT 开关控制"""
+        if not self.config.ALLOW_PUT:
+            return jsonify({
+                "success": False,
+                "error": "PUT operation is disabled by configuration"
+            }), 405
+        # ... 正常处理逻辑 ...
+
+    def delete(self, data_type: str):
+        """删除数据 - 受 ALLOW_DELETE 开关控制"""
+        if not self.config.ALLOW_DELETE:
+            return jsonify({
+                "success": False,
+                "error": "DELETE operation is disabled by configuration"
+            }), 405
+        # ... 正常处理逻辑 ...
+```
+
+### 6.5 配置覆盖优先级
+
+```
+代码默认值（最底层）
+    ← 环境变量覆盖（容器化部署推荐）
+    ← 运行时 override（最高优先级，用于测试）
+```
+
+**示例**：
+```bash
+# 生产部署时通过环境变量开启修改权限
+export DATACENTER_ALLOW_PUT=true
+export DATACENTER_ALLOW_DELETE=false
+python app.py
+
+# 或者 Docker 启动时传递
+docker run -e DATACENTER_ALLOW_PUT=true \
+           -e DATACENTER_DATA_DIR=/data \
+           datacenter:latest
+```
+
+### 6.6 实施步骤
+
+**阶段 1: 基础配置管理**
+1. 创建 `app/config.py`
+2. 实现 `Config` 类（支持环境变量 + 运行时覆盖）
+3. 单元测试：验证默认值、环境变量覆盖、类型转换
+
+**阶段 2: 集成到 Handler**
+1. 修改 `handlers/data_handler.py` 的 `put()` 和 `delete()` 方法
+2. 添加配置开关检查逻辑
+3. 单元测试：验证开关关闭时返回 405
+
+**阶段 3: 文档和示例**
+1. 更新 API 文档（已经包含在 §3.3.0）
+2. 添加配置示例（docker-compose.yml 示例）
+
+---
+
+## 7. 技术架构设计
+
+### 7.1 系统架构图（已更新）
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -1275,7 +1740,7 @@ class DynamicLoader:
 - ✅ 新增 DataProcessor 模块（负责数据读写和验证）
 - ✅ IndexManager 只负责路径计算
 
-### 6.2 数据流图（已更新）
+### 7.2 数据流图（已更新）
 
 **写入数据流**:
 ```
@@ -1298,7 +1763,7 @@ Client → GET /api/v1/data/{data_type} → Handler
   → DataFrame → JSON Response → Client
 ```
 
-### 6.3 模块交互（已更新）
+### 7.3 模块交互（已更新）
 
 | 模块 | 依赖模块 | 被依赖模块 | 职责 |
 |------|----------|------------|------|
@@ -1311,9 +1776,9 @@ Client → GET /api/v1/data/{data_type} → Handler
 
 ---
 
-## 7. 实施计划
+## 8. 实施计划
 
-### 7.1 开发阶段
+### 8.1 开发阶段
 
 **阶段 1: 项目初始化（1-2天）**
 - [ ] 创建项目结构
@@ -1350,7 +1815,7 @@ Client → GET /api/v1/data/{data_type} → Handler
 
 **总计**: 11-16 个工作日
 
-### 7.2 里程碑
+### 8.2 里程碑
 
 | 里程碑 | 时间 | 交付物 |
 |--------|------|--------|
@@ -1360,7 +1825,7 @@ Client → GET /api/v1/data/{data_type} → Handler
 | M4: API 开发 | Day 13 | RESTful API、文档 |
 | M5: 部署完成 | Day 16 | Docker 镜像、部署文档 |
 
-### 7.3 任务分配
+### 8.3 任务分配
 
 **开发者 1**:
 - Config 模块
@@ -1379,9 +1844,9 @@ Client → GET /api/v1/data/{data_type} → Handler
 
 ---
 
-## 8. 风险与注意事项
+## 9. 风险与注意事项
 
-### 8.1 技术风险
+### 9.1 技术风险
 
 | 风险 | 影响 | 概率 | 缓解措施 |
 |------|------|------|----------|
@@ -1390,7 +1855,7 @@ Client → GET /api/v1/data/{data_type} → Handler
 | RESTful API 性能瓶颈 | 高 | 低 | 缓存、分页、异步处理 |
 | 数据丢失 | 高 | 低 | 备份策略、事务支持 |
 
-### 8.2 依赖风险
+### 9.2 依赖风险
 
 | 风险 | 影响 | 概率 | 缓解措施 |
 |------|------|------|----------|
@@ -1398,7 +1863,7 @@ Client → GET /api/v1/data/{data_type} → Handler
 | 192.168.31.32:5001 不可用 | 高 | 低 | 本地缓存镜像 |
 | baseos 更新 | 低 | 高 | 定期同步、测试 |
 
-### 8.3 注意事项
+### 9.3 注意事项
 
 1. **Schema 设计**:
    - 字段类型选择要谨慎（string vs. int）
@@ -1422,28 +1887,30 @@ Client → GET /api/v1/data/{data_type} → Handler
 
 ---
 
-## 9. 附录
+## 10. 附录
 
-### 9.1 参考资料
+### 10.1 参考资料
 
 - [Apache Parquet 官方文档](https://parquet.apache.org/docs/)
 - [PyArrow 文档](https://arrow.apache.org/docs/python/)
 - [OpenAPI 规范](https://swagger.io/specification/)
 - [RESTful API 设计最佳实践](https://restfulapi.net/)
 
-### 9.2 相关项目
+### 10.2 相关项目
 
 - **baseos**: 基础操作系统镜像
 - **restfulapi-interface**: RESTful API 基础镜像
 - **stockdata**: 股票数据采集项目（未来集成）
 
-### 9.3 变更日志
+### 10.3 变更日志
 
 | 版本 | 日期 | 作者 | 变更内容 |
 |------|------|------|----------|
 | v1.0 | 2026-05-17 | AI | 初始版本 |
 | v1.1 | 2026-05-17 | AI | 架构调整：IndexManager纯计算、新增DataProcessor |
 | v1.2 | 2026-05-17 | AI | 三项更新：数据类型不支持动态扩展(版本升级实现)；API新增ALLOW_PUT/ALLOW_DELETE配置开关；API路径体现data_type |
+| v1.3 | 2026-05-17 | AI | 新增 REQ-005 配置管理章节（§6）；更新全文章节编号 |
+| v1.4 | 2026-05-17 | AI | 统一命名：`ALLOW_MODIFY` → `ALLOW_PUT`（全文替换） |
 
 ---
 
