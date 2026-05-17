@@ -131,7 +131,7 @@ DataCenter/
 
 **推荐方案**: **按天存储 + 按市场规模自动分片**
 
-- 默认按天存储：`data/stock/5min/2026-05-17.parquet`
+- 默认按天存储：`data/stock_5min/5min/2026-05-17.parquet`
 - 如果单日数据超过 100万条，自动分片：`2026-05-17_part001.parquet`
 - 支持配置分片阈值
 
@@ -150,7 +150,58 @@ DataCenter/
 
 ### 2.4 存储归类设计
 
-#### 2.4.1 目录结构
+**重要设计变更（REQ-003 新增）**：
+
+不同数据结构可以有不同的存储颗粒度。存储路径模板定义在 schema 的 `storage_rules.path_template` 字段中，IndexManager 根据该模板动态计算路径。
+
+**存储路径原语**（可在 `path_template` 中使用）：
+
+> **设计说明**：`path_template` 是**相对于 `Config.DATA_DIR`** 的路径模板，系统会自动拼接 `Config.DATA_DIR` 前缀，无需在模板中写 `{data_dir}`。
+
+| 原语 | 含义 | 示例 |
+|------|------|------|
+| `{data_type}` | `schema["name"]` | `stock_5min` |
+| `{granularity}` | `schema["granularity"]` | `5min` |
+| `{year}` | `date[:4]` | `2026` |
+| `{month}` | `date[5:7]` | `05` |
+| `{date}` | 请求参数 `date` | `2026-05-17` |
+| `{market}` | 请求参数 `market`（可选） | `XHKG` |
+| `{code}` | 请求参数 `code`（可选） | `00700` |
+| `{size:03d}` | 分片编号（3位零填充） | `001` |
+| `{granularity}` | 存储颗粒度（来自 `granularity` 字段） | `5min`、`1day` |
+| `{year}` | 年份 | `2026` |
+| `{month}` | 月份 | `05` |
+| `{date}` | 完整日期 | `2026-05-17` |
+| `{market}` | 市场代码（可选） | `XHKG`、`XSHG` |
+| `{code}` | 股票代码（可选，用于按股票分文件） | `00700` |
+| `{size}` | 文件大小提示（用于分片） | `001`（分片编号） |
+
+**示例 —— stock_5min 的 path_template**：
+```
+{data_dir}/{data_type}/{granularity}/```
+
+**示例 —— stock_1day 的 path_template**（不同颗粒度，不同路径）：
+```
+{data_dir}/{data_type}/{granularity}/```
+
+#### 2.4.1 目录结构（示例）
+
+> 以下为 `stock_5min` 的默认路径结构，其他数据类型由各自 schema 的 `storage_rules` 决定。
+
+```
+data/
+├── stock_5min/            # data_type = schema.name
+│   └── 5min/            # granularity
+│       └── 2026/
+│           └── 05/
+│               ├── 2026-05-17.parquet
+│               └── 2026-05-18.parquet
+├── stock_1day/           # 另一个 data_type
+│   └── 1day/
+│       └── 2026/
+│           └── 05/
+│               └── 2026-05-17.parquet
+```
 
 ```
 data/
@@ -179,12 +230,18 @@ data/
 
 #### 2.4.2 文件命名规范
 
-**格式**: `{date}[_part{num}].parquet`
+**格式**: `{date}[_part{size:03d}].parquet`（由 schema `storage_rules.partition` 控制）
+
+**分片触发条件**（满足任一即分片）：
+- 文件行数超过 `storage_rules.partition.max_rows`
+- 文件大小超过 `storage_rules.partition.max_size_mb` MB
 
 **示例**:
-- `2026-05-17.parquet` (默认)
-- `2026-05-17_part001.parquet` (分片)
-- `2026-05-17_part002.parquet` (分片)
+- `2026-05-17.parquet` (默认，未触发分片)
+- `2026-05-17_part001.parquet` (触发分片，第1片)
+- `2026-05-17_part002.parquet` (触发分片，第2片)
+
+**注意**：分片编号 `{size}` 在 `path_template` 中用 `{size:03d}` 表示（3位零填充）。
 
 ### 2.5 Schema 模块设计
 
@@ -195,6 +252,70 @@ data/
 2. 根据数据类型和版本获取 schema
 3. 验证数据是否符合 schema
 4. 支持 schema 版本管理
+
+#### 2.5.1.1 Schema JSON 格式（含 `storage_rules`）
+
+**文件命名**: `{name}_v{version}.json`（如 `stock_5min_v1.json`）
+
+**完整格式示例**：
+```json
+{
+  "name": "stock_5min",
+  "version": "v1",
+  "description": "股票5分钟K线数据",
+  "granularity": "5min",
+  "fields": [
+    {"name": "date", "type": "string", "description": "交易日期"},
+    {"name": "code", "type": "string", "description": "股票代码"},
+    {"name": "market", "type": "string", "description": "市场"},
+    {"name": "name", "type": "string", "description": "股票名称"},
+    {"name": "time", "type": "string", "description": "时间HH:MM"},
+    {"name": "open", "type": "double", "description": "开盘价"},
+    {"name": "close", "type": "double", "description": "收盘价"},
+    {"name": "high", "type": "double", "description": "最高价"},
+    {"name": "low", "type": "double", "description": "最低价"},
+    {"name": "volume", "type": "int64", "description": "成交量"}
+  ],
+  "storage_rules": {
+    "path_template": "{data_type}/{granularity}/{year}/{month}/{date}.parquet",
+    "partition": {
+      "by": "date",
+      "max_rows": 1000000,
+      "max_size_mb": 100
+    }
+  }
+}
+```
+
+**字段说明**：
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `name` | string | ✅ | 数据类型名称，**用于 API 路径**（如 `stock_5min`） |
+| `version` | string | ✅ | 版本号（如 `v1`） |
+| `description` | string | ❌ | 描述信息 |
+| `granularity` | string | ✅ | 存储颗粒度（如 `5min`、`1day`） |
+| `fields` | array | ✅ | 字段定义（name/type/description） |
+| `storage_rules` | object | ✅ | 存储规则（见下表） |
+
+**`storage_rules` 字段说明**：
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `path_template` | string | ✅ | 路径模板，支持原语 `{data_dir}` `{data_type}` `{granularity}` `{year}` `{month}` `{date}` `{market}` `{code}` |
+| `partition.by` | string | ✅ | 分片依据（`date`=按天，`code`=按股票） |
+| `partition.max_rows` | int | ✅ | 单文件最大行数 |
+| `partition.max_size_mb` | int | ✅ | 单文件最大大小（MB） |
+
+**不同数据类型的 `path_template` 可以不同**：
+
+| 数据类型 | `path_template` |
+|----------|-------------|
+| `stock_5min` | `{data_type}/{granularity}/{year}/{month}/{date}.parquet` |
+| `stock_1day` | `{data_type}/{granularity}/{year}/{month}/{date}.parquet` |
+| `index_weight` | `{data_dir}/{data_type}/{year}/{month}/{date}.parquet` |
+
+---
 
 **核心接口**:
 ```python
@@ -213,6 +334,8 @@ class SchemaManager:
         
     def list_schemas(self) -> List[dict]:
         """列出所有可用的 schema"""
+    def get_storage_rules(self, data_type: str, version: str) -> dict:
+        """获取 storage_rules（供 IndexManager 使用）"""
 ```
 
 #### 2.5.2 Schema 加载流程
@@ -258,50 +381,85 @@ class SchemaManager:
 **核心接口**：
 ```python
 class IndexManager:
-    def __init__(self, data_dir: str):
-        """初始化索引管理器"""
-        self.data_dir = data_dir
+    def __init__(self, schema_manager: SchemaManager):
+        """初始化索引管理器（依赖 SchemaManager）"""
+        self.schema_manager = schema_manager
         
-    def get_write_path(self, data_type: str, granularity: str, 
-                        date: str, market: str = None) -> str:
-        """获取数据写入路径（单个文件）"""
-        # 示例返回: data/stock/5min/2026/05/2026-05-17.parquet
+    def get_write_path(self, data_type: str, version: str,
+                        date: str, market: str = None,
+                        code: str = None) -> str:
+        """获取数据写入路径（渲染 path_template）"""
+        # 1. 从 schema 获取 storage_rules
+        # 2. 渲染 path_template
+        # 3. 返回完整路径
+        # 示例返回: data/stock_5min/5min/2026/05/2026-05-17.parquet
         
-    def get_read_paths(self, data_type: str, granularity: str,
+    def get_read_paths(self, data_type: str, version: str,
                        start_date: str, end_date: str,
                        market: str = None) -> List[str]:
         """获取数据读取路径（可能多个文件）"""
+        # 1. 从 schema 获取 storage_rules.path_template
+        # 2. 根据 date 范围渲染多个路径
+        # 3. 返回路径列表
         # 示例返回: [
-        #   "data/stock/5min/2026/05/2026-05-17.parquet",
-        #   "data/stock/5min/2026/05/2026-05-18.parquet"
+        #   "data/stock_5min/5min/2026/05/2026-05-17.parquet",
+        #   "data/stock_5min/5min/2026/05/2026-05-18.parquet"
         # ]
         
-    def get_partition_paths(self, data_type: str, granularity: str,
-                           date: str) -> List[str]:
-        """获取分区路径（用于分区写入）"""
-        # 如果数据量大，返回分片路径
+    def get_partition_paths(self, data_type: str, version: str,
+                           date: str, data: pd.DataFrame = None) -> List[str]:
+        """获取分片路径（用于分片写入）"""
+        # 1. 从 schema 获取 storage_rules.partition
+        # 2. 如果 data 行数超过 max_rows 或大小超过 max_size_mb，计算分片路径
+        # 3. 替换 {size:03d} 为分片编号
         # 示例: [
-        #   "data/stock/5min/2026/05/2026-05-17_part001.parquet",
-        #   "data/stock/5min/2026/05/2026-05-17_part002.parquet"
+        #   "data/stock_5min/5min/2026/05/2026-05-17_part001.parquet",
+        #   "data/stock_5min/5min/2026/05/2026-05-17_part002.parquet"
         # ]
         
-    def validate_path(self, path: str) -> bool:
-        """验证路径是否符合规范"""
 ```
 
 #### 2.6.3 路径计算规则
 
-**路径格式**：`{data_dir}/{data_type}/{granularity}/YYYY/MM/{date}.parquet`
+**路径格式**：由 schema `storage_rules.path_template` 定义（支持原语替换）
 
-**示例**：
-- 股票 5 分钟数据：`data/stock/5min/2026/05/2026-05-17.parquet`
-- 股票日线数据：`data/stock/1day/2026/05/2026-05-17.parquet`
-- 指数成分股：`data/index/constituents/2026/05/2026-05-17.parquet`
+**原语替换规则**：
 
-**分片规则**：
-- 单文件超过 100MB 或 100 万条记录时自动分片
-- 分片格式：`{date}_part{num:03d}.parquet`
-- 示例：`2026-05-17_part001.parquet`
+> **说明**：`IndexManager` 渲染路径时自动拼接 `Config.DATA_DIR` 前缀。
+
+| 原语 | 替换为 | 示例 |
+|------|--------|------|
+| `{data_type}` | `schema["name"]` | `stock_5min` |
+| `{granularity}` | `schema["granularity"]` | `5min` |
+| `{year}` | `date[:4]` | `2026` |
+| `{month}` | `date[5:7]` | `05` |
+| `{date}` | 请求参数 `date` | `2026-05-17` |
+| `{market}` | 请求参数 `market`（可选） | `XHKG` |
+| `{code}` | 请求参数 `code`（可选） | `00700` |
+| `{size:03d}` | 分片编号（3位零填充） | `001` |
+| `{granularity}` | `schema["granularity"]` | `5min` |
+| `{year}` | `date[:4]` | `2026` |
+| `{month}` | `date[5:7]` | `05` |
+| `{date}` | 请求参数 `date` | `2026-05-17` |
+| `{market}` | 请求参数 `market`（可选） | `XHKG` |
+| `{code}` | 请求参数 `code`（可选） | `00700` |
+| `{size:03d}` | 分片编号（3位零填充） | `001` |
+
+**示例（`stock_5min`）**：
+
+`path_template` = `{data_type}/{granularity}/{year}/{month}/{date}.parquet`
+
+渲染结果：
+```
+# Config.DATA_DIR = "./data"
+# 渲染结果（系统自动拼接 data_dir）:
+./data/stock_5min/5min/2026/05/2026-05-17.parquet
+```
+
+**分片规则**（由 `storage_rules.partition` 控制）：
+- 触发条件：`data.rows > max_rows` 或 `file_size > max_size_mb`
+- 分片格式：`{date}_part{size:03d}.parquet`
+- 示例：`2026-05-17_part001.parquet`、`2026-05-17_part002.parquet`
 
 ### 2.7 数据处理模块设计（新增）
 
@@ -420,7 +578,7 @@ result = processor.write_data(
 # {
 #   "success": True,
 #   "rows_written": 48,
-#   "file_path": "data/stock/5min/2026/05/2026-05-17.parquet",
+#   "file_path": "data/stock_5min/5min/2026/05/2026-05-17.parquet",
 #   "duplicates_found": 2,
 #   "duplicates_removed": 0
 # }
@@ -645,7 +803,7 @@ class StorageManager:
 **需求描述**:
 - 微服务架构，使用 RESTful API 接口进行数据存储和提取
 - 集成 restful-interface
-- 按照数据类型定义 API 的结构和操作
+- 按照 **`schema.name`** 定义 API 的结构和操作（如 `stock_5min`）
 - 建立 RESTful API 文档，定义 API
 - 按照 restful 基础镜像的要求实现 interface 和 handler
 
@@ -716,19 +874,19 @@ class Config:
 
 | HTTP 方法 | 端点 | 功能 | 请求体 | 响应 | 开关控制 |
 |-----------|------|------|--------|------|----------|
-| POST | `/api/v1/data/{data_type}` | 写入数据 | JSON | 写入结果 | - |
-| GET | `/api/v1/data/{data_type}` | 查询数据 | Query 参数 | JSON | - |
-| PUT | `/api/v1/data/{data_type}` | 更新数据 | JSON | 更新结果 | ALLOW_PUT |
-| DELETE | `/api/v1/data/{data_type}` | 删除数据 | Query 参数 | 删除结果 | ALLOW_DELETE |
-| GET | `/api/v1/data/{data_type}/schemas` | 列出 schema | - | JSON | - |
-| GET | `/api/v1/data/{data_type}/stats` | 存储统计 | - | JSON | - |
+| POST    | `/api/v1/data/{data_type}` | 写入数据，`data_type`=schema.name（如 `stock_5min`） | JSON | 写入结果 | - |
+| GET     | `/api/v1/data/{data_type}` | 查询数据，`data_type`=schema.name（如 `stock_5min`） | Query 参数 | JSON | - |
+| PUT     | `/api/v1/data/{data_type}` | 更新数据，`data_type`=schema.name | JSON | 更新结果 | ALLOW_PUT |
+| DELETE  | `/api/v1/data/{data_type}` | 删除数据，`data_type`=schema.name | Query 参数 | 删除结果 | ALLOW_DELETE |
+| GET     | `/api/v1/data/{data_type}/schemas` | 列出 schema，`data_type`=schema.name | - | JSON | - |
+| GET     | `/api/v1/data/{data_type}/stats` | 存储统计，`data_type`=schema.name | - | JSON | - |
 
 #### 3.3.2 API 详细说明
 
 **1. 写入数据**
 
 ```
-POST /api/v1/data/stock
+POST /api/v1/data/stock_5min
 Content-Type: application/json
 
 {
@@ -760,9 +918,9 @@ Content-Type: application/json
   "success": true,
   "message": "Data written successfully",
   "details": {
-    "data_type": "stock",
+    "data_type": "stock_5min",
     "rows_written": 1,
-    "file_path": "data/stock/5min/2026/05/2026-05-17.parquet",
+    "file_path": "data/stock_5min/5min/2026/05/2026-05-17.parquet",
     "schema": "stock_5min_v1"
   }
 }
@@ -771,7 +929,7 @@ Content-Type: application/json
 **2. 查询数据**
 
 ```
-GET /api/v1/data/stock?granularity=5min&start_date=2026-05-17&end_date=2026-05-18&market=XHKG&codes=00700,00701
+GET /api/v1/data/stock_5min?granularity=5min&start_date=2026-05-17&end_date=2026-05-18&market=XHKG&codes=00700,00701
 ```
 
 > **变更说明**：data_type 从 Query 参数移到 URL 路径中
@@ -782,7 +940,7 @@ GET /api/v1/data/stock?granularity=5min&start_date=2026-05-17&end_date=2026-05-1
   "success": true,
   "data": [...],
   "metadata": {
-    "data_type": "stock",
+    "data_type": "stock_5min",
     "total_rows": 96,
     "files_read": 2,
     "schema": "stock_5min_v1"
@@ -793,7 +951,7 @@ GET /api/v1/data/stock?granularity=5min&start_date=2026-05-17&end_date=2026-05-1
 **3. 更新数据**（受 ALLOW_PUT 开关控制）
 
 ```
-PUT /api/v1/data/stock
+PUT /api/v1/data/stock_5min
 Content-Type: application/json
 
 {
@@ -815,7 +973,7 @@ HTTP 405
 **4. 删除数据**（受 ALLOW_DELETE 开关控制）
 
 ```
-DELETE /api/v1/data/stock?granularity=5min&start_date=2026-05-17&end_date=2026-05-17
+DELETE /api/v1/data/stock_5min?granularity=5min&start_date=2026-05-17&end_date=2026-05-17
 ```
 
 **开关关闭时响应**:
@@ -837,7 +995,7 @@ GET /api/v1/data/stock/schemas
 ```json
 {
   "success": true,
-  "data_type": "stock",
+  "data_type": "stock_5min",
   "schemas": [
     {
       "name": "stock_5min",
