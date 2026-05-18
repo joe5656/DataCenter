@@ -21,7 +21,9 @@
 ### REQ-003 存储数据类型灵活，支持拓展
 不同数据类型注册不同schema
 不同版本的schema可以不同
-不同的数据结构可以有不同的存储颗粒度，需要设计一套存储路径表示原语，在schema中加入存储规则字段，计算存储路径时根据它进行，原语应该有（year，data）等表示时间的字段，也应该有（data_type， size）等描述数据类型和存储属性的字段提供schema使用
+schema的基本格式应该包含: name, version, data_schema {......}, storage_rule这几个标准字段，
+load schema时需要做schema合法性检查，要求必须带这几个字段，且data_schema内部必须是key-value的键值对，不允许再有更深的结构
+storage_rule是存储路径的原语表示，必须以.parquet结尾（路径详细到文件），用schema.xxx格式表示schema里各个字段， 
 当前支持的数据类型：股票数据的5min数据 （日期 股票代码 市场 股票名称 时间 开盘 收盘 最高 最低 成交量）
 
 ### REQ-004 依赖关系

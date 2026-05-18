@@ -1,1 +1,17 @@
-{"name": "stock_5min", "version": "v1", "granularity": "5min", "fields": [{"name": "date", "type": "string"}], "storage_rules": {"path_template": "{data_type}/{granularity}/{year}/{month}/{date}.parquet", "partition": {"by": "date", "max_rows": 1000000, "max_size_mb": 100}}}
+{
+    "name": "stock_5min",
+    "version": "v1",
+    "data_schema": {
+        "date": "string",
+        "code": "string",
+        "market": "string",
+        "name": "string",
+        "time": "string",
+        "open": "double",
+        "close": "double",
+        "high": "double",
+        "low": "double",
+        "volume": "int64"
+    },
+    "storage_rule": "{schema.name}/{schema.date}.parquet"
+}

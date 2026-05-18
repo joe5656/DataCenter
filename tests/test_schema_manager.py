@@ -1,13 +1,16 @@
 """
-Tests for SchemaManager (§2.5)
+Tests for SchemaManager (REQ-003)
 
 测试覆盖：
 1. Schema 加载（正常 / 缺失字段 / 类型错误）
-2. get_storage_rules / get_granularity
-3. validate_data
-4. get_parquet_schema
-5. list_schemas / get_schema_for_api
-6. 文件命名规范（只加载 {name}_v{version}.json）
+2. data_schema 验证（非 dict / 嵌套 / 空 / 非法类型）
+3. storage_rule 验证（不以 .parquet 结尾 / 引用未定义字段）
+4. {schema.xxx} 引用提取
+5. get_storage_rule / get_data_schema
+6. validate_data
+7. get_parquet_schema
+8. list_schemas / get_schema_for_api
+9. 边界情况
 """
 
 import json
@@ -29,55 +32,37 @@ def schema_dir(tmp_path):
     stock_5min = {
         "name": "stock_5min",
         "version": "v1",
-        "description": "股票5分钟K线",
-        "granularity": "5min",
-        "fields": [
-            {"name": "date", "type": "string", "description": "交易日期"},
-            {"name": "code", "type": "string", "description": "股票代码"},
-            {"name": "market", "type": "string", "description": "市场"},
-            {"name": "name", "type": "string", "description": "股票名称"},
-            {"name": "time", "type": "string", "description": "时间HH:MM"},
-            {"name": "open", "type": "double", "description": "开盘价"},
-            {"name": "close", "type": "double", "description": "收盘价"},
-            {"name": "high", "type": "double", "description": "最高价"},
-            {"name": "low", "type": "double", "description": "最低价"},
-            {"name": "volume", "type": "int64", "description": "成交量"},
-        ],
-        "storage_rules": {
-            "path_template": "{data_type}/{granularity}/{year}/{month}/{date}.parquet",
-            "partition": {
-                "by": "date",
-                "max_rows": 1000000,
-                "max_size_mb": 100,
-            },
+        "data_schema": {
+            "date": "string",
+            "code": "string",
+            "market": "string",
+            "name": "string",
+            "time": "string",
+            "open": "double",
+            "close": "double",
+            "high": "double",
+            "low": "double",
+            "volume": "int64",
         },
+        "storage_rule": "{schema.name}/{schema.date}.parquet",
     }
     (d / "stock_5min_v1.json").write_text(
         json.dumps(stock_5min, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
-    # 2. 正确的 schema：stock_1day_v1.json（无 time 字段）
+    # 2. 正确的 schema：stock_1day_v1.json（日线，用年月分目录）
     stock_1day = {
         "name": "stock_1day",
         "version": "v1",
-        "description": "股票日线数据",
-        "granularity": "1day",
-        "fields": [
-            {"name": "date", "type": "string", "description": "交易日期"},
-            {"name": "code", "type": "string", "description": "股票代码"},
-            {"name": "open", "type": "double", "description": "开盘价"},
-            {"name": "close", "type": "double", "description": "收盘价"},
-            {"name": "volume", "type": "int64", "description": "成交量"},
-        ],
-        "storage_rules": {
-            "path_template": "{data_type}/{granularity}/{year}/{month}/{date}.parquet",
-            "partition": {
-                "by": "date",
-                "max_rows": 500000,
-                "max_size_mb": 200,
-            },
+        "data_schema": {
+            "date": "string",
+            "code": "string",
+            "open": "double",
+            "close": "double",
+            "volume": "int64",
         },
+        "storage_rule": "{schema.name}/{schema.date}.parquet",
     }
     (d / "stock_1day_v1.json").write_text(
         json.dumps(stock_1day, ensure_ascii=False, indent=2),
@@ -85,18 +70,83 @@ def schema_dir(tmp_path):
     )
 
     # 3. 缺失必填字段的 schema（加载时应跳过并警告）
-    bad_schema = {
-        "name": "bad_schema",
+    bad_missing = {
+        "name": "bad_missing",
         "version": "v1",
-        # 缺少 granularity, fields, storage_rules
+        # 缺少 data_schema 和 storage_rule
     }
-    (d / "bad_schema_v1.json").write_text(
-        json.dumps(bad_schema), encoding="utf-8"
+    (d / "bad_missing_v1.json").write_text(
+        json.dumps(bad_missing), encoding="utf-8"
     )
 
-    # 4. 不符合命名规范的文件（不应加载）
+    # 4. data_schema 不是 key-value 的（嵌套）
+    bad_nested = {
+        "name": "bad_nested",
+        "version": "v1",
+        "data_schema": {
+            "date": "string",
+            "extra": {"nested": "value"},
+        },
+        "storage_rule": "{schema.name}/{schema.date}.parquet",
+    }
+    (d / "bad_nested_v1.json").write_text(
+        json.dumps(bad_nested), encoding="utf-8"
+    )
+
+    # 5. storage_rule 不以 .parquet 结尾
+    bad_no_parquet = {
+        "name": "bad_no_parquet",
+        "version": "v1",
+        "data_schema": {
+            "date": "string",
+        },
+        "storage_rule": "{schema.name}/{schema.date}",
+    }
+    (d / "bad_no_parquet_v1.json").write_text(
+        json.dumps(bad_no_parquet), encoding="utf-8"
+    )
+
+    # 6. storage_rule 引用了 data_schema 中不存在的字段
+    bad_undefined_ref = {
+        "name": "bad_undef_ref",
+        "version": "v1",
+        "data_schema": {
+            "date": "string",
+        },
+        "storage_rule": "{schema.name}/{schema.undefined_field}.parquet",
+    }
+    (d / "bad_undef_ref_v1.json").write_text(
+        json.dumps(bad_undefined_ref), encoding="utf-8"
+    )
+
+    # 7. data_schema 包含非法类型
+    bad_type = {
+        "name": "bad_type",
+        "version": "v1",
+        "data_schema": {
+            "date": "string",
+            "price": "decimal",  # 不在 _TYPE_MAP 中
+        },
+        "storage_rule": "{schema.name}/{schema.date}.parquet",
+    }
+    (d / "bad_type_v1.json").write_text(
+        json.dumps(bad_type), encoding="utf-8"
+    )
+
+    # 8. 空 data_schema
+    bad_empty_ds = {
+        "name": "bad_empty_ds",
+        "version": "v1",
+        "data_schema": {},
+        "storage_rule": "{schema.name}.parquet",
+    }
+    (d / "bad_empty_ds_v1.json").write_text(
+        json.dumps(bad_empty_ds), encoding="utf-8"
+    )
+
+    # 9. 不符合命名规范的文件（不应加载）
     (d / "readme.txt").write_text("not a schema", encoding="utf-8")
-    (d / "stock_v1.json").write_text("{}", encoding="utf-8")  # 缺少 _v 分隔符
+    (d / "stock_v1.json").write_text("{}", encoding="utf-8")
 
     return str(d)
 
@@ -105,7 +155,6 @@ def schema_dir(tmp_path):
 def manager(schema_dir):
     """创建一个 SchemaManager 实例"""
     from app.schema_manager import SchemaManager
-
     return SchemaManager(schema_dir)
 
 
@@ -124,58 +173,300 @@ class TestSchemaLoading:
 
     def test_skip_invalid_naming(self, manager):
         """不符合 {name}_v{version}.json 命名的文件应跳过"""
-        # readme.txt 和 stock_v1.json 不应被加载
         schemas = manager.list_schemas()
         names = [s["name"] for s in schemas]
         assert "readme" not in names
-        assert "stock" not in names  # stock_v1.json 不符合规范
+        assert "stock" not in names
 
-    def test_skip_bad_schema(self, manager):
-        """结构不合法的 schema 应跳过（不阻断启动）"""
-        # bad_schema_v1.json 缺少必填字段，应被跳过
+    def test_skip_missing_fields(self, manager):
+        """缺少必填字段的 schema 应跳过"""
         schemas = manager.list_schemas()
         names = [s["name"] for s in schemas]
-        assert "bad_schema" not in names
+        assert "bad_missing" not in names
+
+    def test_skip_nested_data_schema(self, manager):
+        """data_schema 嵌套的 schema 应跳过"""
+        schemas = manager.list_schemas()
+        names = [s["name"] for s in schemas]
+        assert "bad_nested" not in names
+
+    def test_skip_no_parquet_suffix(self, manager):
+        """storage_rule 不以 .parquet 结尾的 schema 应跳过"""
+        schemas = manager.list_schemas()
+        names = [s["name"] for s in schemas]
+        assert "bad_no_parquet" not in names
+
+    def test_skip_undefined_ref(self, manager):
+        """storage_rule 引用未定义字段的 schema 应跳过"""
+        schemas = manager.list_schemas()
+        names = [s["name"] for s in schemas]
+        assert "bad_undef_ref" not in names
+
+    def test_skip_bad_type(self, manager):
+        """data_schema 包含非法类型的 schema 应跳过"""
+        schemas = manager.list_schemas()
+        names = [s["name"] for s in schemas]
+        assert "bad_type" not in names
+
+    def test_skip_empty_data_schema(self, manager):
+        """空 data_schema 的 schema 应跳过"""
+        schemas = manager.list_schemas()
+        names = [s["name"] for s in schemas]
+        assert "bad_empty_ds" not in names
 
     def test_list_schemas_returns_summary(self, manager):
-        """list_schemas 返回摘要（不含完整 fields）"""
+        """list_schemas 返回摘要"""
         schemas = manager.list_schemas()
         for s in schemas:
             assert "name" in s
             assert "version" in s
-            assert "granularity" in s
-            assert "description" in s
+            assert "storage_rule" in s
             assert "fields_count" in s
             assert isinstance(s["fields_count"], int)
 
 
 # ------------------------------------------------------------------ #
-# 测试 get_storage_rules / get_granularity
+# 测试 _extract_schema_refs
 # ------------------------------------------------------------------ #
 
 
-class TestStorageRules:
-    def test_get_storage_rules(self, manager):
-        """获取 storage_rules"""
-        rules = manager.get_storage_rules("stock_5min", "v1")
-        assert "path_template" in rules
-        assert "partition" in rules
-        assert rules["partition"]["by"] == "date"
-        assert rules["partition"]["max_rows"] == 1000000
+class TestExtractSchemaRefs:
+    def test_single_ref(self):
+        """提取单个 {schema.xxx}"""
+        from app.schema_manager import SchemaManager
+        refs = SchemaManager._extract_schema_refs("{schema.name}/{schema.date}.parquet")
+        assert refs == ["name", "date"]
 
-    def test_get_storage_rules_raises_for_unknown(self, manager):
-        """查询不存在的 schema 应抛出 KeyError"""
+    def test_no_refs(self):
+        """无 {schema.xxx} 引用"""
+        from app.schema_manager import SchemaManager
+        refs = SchemaManager._extract_schema_refs("static/path.parquet")
+        assert refs == []
+
+    def test_duplicate_refs(self):
+        """同一字段引用多次"""
+        from app.schema_manager import SchemaManager
+        refs = SchemaManager._extract_schema_refs("{schema.name}/{schema.name}.parquet")
+        assert refs == ["name", "name"]
+
+    def test_mixed_braces(self):
+        """混合 {schema.xxx} 和普通文本"""
+        from app.schema_manager import SchemaManager
+        refs = SchemaManager._extract_schema_refs("data/{schema.name}/year={schema.date}/file.parquet")
+        assert refs == ["name", "date"]
+
+
+# ------------------------------------------------------------------ #
+# 直接测试 _validate_schema（精准验证逻辑，不依赖加载流程）
+# ------------------------------------------------------------------ #
+
+
+class TestValidateSchema:
+    """直接调用 _validate_schema，精准测试每条检查规则"""
+
+    def _make_mgr(self):
+        from app.schema_manager import SchemaManager
+        # 创建一个空目录的 manager，只用其 _validate_schema 方法
+        import tempfile
+        d = tempfile.mkdtemp()
+        return SchemaManager(d)
+
+    # --- 必填字段检查 ---
+
+    def test_missing_name(self):
+        m = self._make_mgr()
+        with pytest.raises(ValueError, match="missing required field 'name'"):
+            m._validate_schema({"version": "v1", "data_schema": {"x": "string"}, "storage_rule": "{schema.name}.parquet"}, "f.json")
+
+    def test_missing_version(self):
+        m = self._make_mgr()
+        with pytest.raises(ValueError, match="missing required field 'version'"):
+            m._validate_schema({"name": "t", "data_schema": {"x": "string"}, "storage_rule": "{schema.name}.parquet"}, "f.json")
+
+    def test_missing_data_schema(self):
+        m = self._make_mgr()
+        with pytest.raises(ValueError, match="missing required field 'data_schema'"):
+            m._validate_schema({"name": "t", "version": "v1", "storage_rule": "{schema.name}.parquet"}, "f.json")
+
+    def test_missing_storage_rule(self):
+        m = self._make_mgr()
+        with pytest.raises(ValueError, match="missing required field 'storage_rule'"):
+            m._validate_schema({"name": "t", "version": "v1", "data_schema": {"x": "string"}}, "f.json")
+
+    # --- data_schema 检查 ---
+
+    def test_data_schema_not_dict(self):
+        m = self._make_mgr()
+        with pytest.raises(ValueError, match="must be a key-value dict"):
+            m._validate_schema({"name": "t", "version": "v1", "data_schema": "not a dict", "storage_rule": "{schema.name}.parquet"}, "f.json")
+
+    def test_data_schema_list(self):
+        m = self._make_mgr()
+        with pytest.raises(ValueError, match="must be a key-value dict"):
+            m._validate_schema({"name": "t", "version": "v1", "data_schema": [{"name": "x"}], "storage_rule": "{schema.name}.parquet"}, "f.json")
+
+    def test_data_schema_empty(self):
+        m = self._make_mgr()
+        with pytest.raises(ValueError, match="must not be empty"):
+            m._validate_schema({"name": "t", "version": "v1", "data_schema": {}, "storage_rule": "{schema.name}.parquet"}, "f.json")
+
+    def test_data_schema_value_is_list(self):
+        m = self._make_mgr()
+        with pytest.raises(ValueError, match="str->str"):
+            m._validate_schema({"name": "t", "version": "v1", "data_schema": {"x": [1, 2]}, "storage_rule": "{schema.name}.parquet"}, "f.json")
+
+    def test_data_schema_value_is_dict(self):
+        m = self._make_mgr()
+        with pytest.raises(ValueError, match="str->str"):
+            m._validate_schema({"name": "t", "version": "v1", "data_schema": {"x": {"nested": True}}, "storage_rule": "{schema.name}.parquet"}, "f.json")
+
+    def test_data_schema_value_is_int(self):
+        m = self._make_mgr()
+        with pytest.raises(ValueError, match="str->str"):
+            m._validate_schema({"name": "t", "version": "v1", "data_schema": {"x": 42}, "storage_rule": "{schema.name}.parquet"}, "f.json")
+
+    def test_data_schema_unsupported_type(self):
+        m = self._make_mgr()
+        with pytest.raises(ValueError, match="unsupported type 'decimal'"):
+            m._validate_schema({"name": "t", "version": "v1", "data_schema": {"x": "decimal"}, "storage_rule": "{schema.name}.parquet"}, "f.json")
+
+    def test_data_schema_unsupported_type_varchar(self):
+        m = self._make_mgr()
+        with pytest.raises(ValueError, match="unsupported type 'varchar'"):
+            m._validate_schema({"name": "t", "version": "v1", "data_schema": {"x": "varchar"}, "storage_rule": "{schema.name}.parquet"}, "f.json")
+
+    def test_data_schema_all_supported_types(self):
+        """所有 _TYPE_MAP 中的类型都应通过"""
+        m = self._make_mgr()
+        schema = {
+            "name": "t", "version": "v1",
+            "data_schema": {
+                "f_string": "string", "f_int64": "int64", "f_int32": "int32",
+                "f_int16": "int16", "f_int8": "int8", "f_uint64": "uint64",
+                "f_float": "float", "f_double": "double", "f_bool": "bool",
+                "f_date": "date", "f_datetime": "datetime", "f_timestamp": "timestamp",
+            },
+            "storage_rule": "{schema.name}/{schema.f_string}.parquet",
+        }
+        m._validate_schema(schema, "all_types.json")  # 不抛异常即通过
+
+    # --- storage_rule 检查 ---
+
+    def test_storage_rule_not_string(self):
+        m = self._make_mgr()
+        with pytest.raises(ValueError, match="must be a string"):
+            m._validate_schema({"name": "t", "version": "v1", "data_schema": {"x": "string"}, "storage_rule": 123}, "f.json")
+
+    def test_storage_rule_is_list(self):
+        m = self._make_mgr()
+        with pytest.raises(ValueError, match="must be a string"):
+            m._validate_schema({"name": "t", "version": "v1", "data_schema": {"x": "string"}, "storage_rule": ["a"]}, "f.json")
+
+    def test_storage_rule_no_parquet_suffix(self):
+        m = self._make_mgr()
+        with pytest.raises(ValueError, match="must end with '.parquet'"):
+            m._validate_schema({"name": "t", "version": "v1", "data_schema": {"x": "string"}, "storage_rule": "{schema.name}/{schema.x}.csv"}, "f.json")
+
+    def test_storage_rule_no_suffix_at_all(self):
+        m = self._make_mgr()
+        with pytest.raises(ValueError, match="must end with '.parquet'"):
+            m._validate_schema({"name": "t", "version": "v1", "data_schema": {"x": "string"}, "storage_rule": "{schema.name}"}, "f.json")
+
+    def test_storage_rule_dot_parquet_in_middle(self):
+        """仅含 .parquet 但不在末尾应失败"""
+        m = self._make_mgr()
+        with pytest.raises(ValueError, match="must end with '.parquet'"):
+            m._validate_schema({"name": "t", "version": "v1", "data_schema": {"x": "string"}, "storage_rule": "{schema.name}.parquet/{schema.x}"}, "f.json")
+
+    # --- {schema.xxx} 引用检查 ---
+
+    def test_ref_builtin_name_ok(self):
+        """{schema.name} 是内置引用，即使 data_schema 没有 name 字段也应通过"""
+        m = self._make_mgr()
+        schema = {"name": "t", "version": "v1", "data_schema": {"x": "string"}, "storage_rule": "{schema.name}/{schema.x}.parquet"}
+        m._validate_schema(schema, "ok.json")  # 不抛异常
+
+    def test_ref_builtin_version_ok(self):
+        """{schema.version} 是内置引用"""
+        m = self._make_mgr()
+        schema = {"name": "t", "version": "v1", "data_schema": {"x": "string"}, "storage_rule": "{schema.version}/{schema.x}.parquet"}
+        m._validate_schema(schema, "ok.json")  # 不抛异常
+
+    def test_ref_undefined_field(self):
+        m = self._make_mgr()
+        with pytest.raises(ValueError, match="'undefined_field' is not defined in data_schema"):
+            m._validate_schema({"name": "t", "version": "v1", "data_schema": {"x": "string"}, "storage_rule": "{schema.undefined_field}.parquet"}, "f.json")
+
+    def test_ref_multiple_undefined(self):
+        m = self._make_mgr()
+        # 报第一个未定义的
+        with pytest.raises(ValueError, match="'missing_a' is not defined in data_schema"):
+            m._validate_schema({"name": "t", "version": "v1", "data_schema": {"x": "string"}, "storage_rule": "{schema.missing_a}/{schema.missing_b}.parquet"}, "f.json")
+
+    def test_ref_no_schema_refs(self):
+        """没有 {schema.xxx} 的静态路径也应通过"""
+        m = self._make_mgr()
+        schema = {"name": "t", "version": "v1", "data_schema": {"x": "string"}, "storage_rule": "static/path/data.parquet"}
+        m._validate_schema(schema, "ok.json")  # 不抛异常
+
+    def test_ref_field_defined_in_data_schema(self):
+        """{schema.xxx} 引用 data_schema 中已有的字段"""
+        m = self._make_mgr()
+        schema = {"name": "t", "version": "v1", "data_schema": {"market": "string", "date": "string"}, "storage_rule": "{schema.name}/{schema.market}/{schema.date}.parquet"}
+        m._validate_schema(schema, "ok.json")  # 不抛异常
+
+    # --- 正常 schema 完整验证 ---
+
+    def test_valid_schema_passes(self):
+        m = self._make_mgr()
+        schema = {
+            "name": "test_type",
+            "version": "v2",
+            "data_schema": {"date": "string", "value": "double"},
+            "storage_rule": "{schema.name}/{schema.date}.parquet",
+        }
+        m._validate_schema(schema, "valid.json")  # 不抛异常即通过
+
+    def test_valid_schema_with_extra_top_level_fields(self):
+        """schema 可以有额外顶层字段（如 description）"""
+        m = self._make_mgr()
+        schema = {
+            "name": "test_type", "version": "v1",
+            "description": "测试 schema",
+            "author": "someone",
+            "data_schema": {"date": "string"},
+            "storage_rule": "{schema.name}.parquet",
+        }
+        m._validate_schema(schema, "ok.json")  # 不抛异常
+
+
+# ------------------------------------------------------------------ #
+# 测试 get_storage_rule / get_data_schema
+# ------------------------------------------------------------------ #
+
+
+class TestSchemaAccessors:
+    def test_get_storage_rule(self, manager):
+        """获取 storage_rule 路径模板"""
+        rule = manager.get_storage_rule("stock_5min", "v1")
+        assert rule == "{schema.name}/{schema.date}.parquet"
+
+    def test_get_storage_rule_raises_for_unknown(self, manager):
         with pytest.raises(KeyError):
-            manager.get_storage_rules("nonexistent", "v1")
+            manager.get_storage_rule("nonexistent", "v1")
 
-    def test_get_granularity(self, manager):
-        """获取 granularity"""
-        assert manager.get_granularity("stock_5min", "v1") == "5min"
-        assert manager.get_granularity("stock_1day", "v1") == "1day"
+    def test_get_data_schema(self, manager):
+        """获取 data_schema 字典"""
+        ds = manager.get_data_schema("stock_5min", "v1")
+        assert isinstance(ds, dict)
+        assert ds["date"] == "string"
+        assert ds["code"] == "string"
+        assert ds["volume"] == "int64"
+        assert len(ds) == 10
 
-    def test_get_granularity_raises_for_unknown(self, manager):
+    def test_get_data_schema_raises_for_unknown(self, manager):
         with pytest.raises(KeyError):
-            manager.get_granularity("nonexistent", "v1")
+            manager.get_data_schema("nonexistent", "v1")
 
 
 # ------------------------------------------------------------------ #
@@ -186,38 +477,35 @@ class TestStorageRules:
 class TestValidateData:
     def test_validate_valid_data(self, manager):
         """验证合法数据"""
-        df = pd.DataFrame(
-            [
-                {
-                    "date": "2026-05-17",
-                    "code": "00700",
-                    "market": "XHKG",
-                    "name": "腾讯控股",
-                    "time": "09:30",
-                    "open": 380.0,
-                    "close": 381.0,
-                    "high": 381.5,
-                    "low": 379.5,
-                    "volume": 120000,
-                }
-            ]
-        )
+        df = pd.DataFrame([
+            {
+                "date": "2026-05-17",
+                "code": "00700",
+                "market": "XHKG",
+                "name": "腾讯控股",
+                "time": "09:30",
+                "open": 380.0,
+                "close": 381.0,
+                "high": 381.5,
+                "low": 379.5,
+                "volume": 120000,
+            }
+        ])
         valid, errors = manager.validate_data(df, "stock_5min", "v1")
         assert valid is True
         assert errors == []
 
     def test_validate_missing_columns(self, manager):
         """缺少必填字段应返回 False"""
-        df = pd.DataFrame([{"date": "2026-05-17"}])  # 缺少其他字段
+        df = pd.DataFrame([{"date": "2026-05-17"}])
         valid, errors = manager.validate_data(df, "stock_5min", "v1")
         assert valid is False
         assert any("Missing" in e for e in errors)
 
     def test_validate_empty_dataframe(self, manager):
-        """空 DataFrame 应通过验证（没有缺失字段）"""
+        """空 DataFrame 应返回 False"""
         df = pd.DataFrame()
         valid, errors = manager.validate_data(df, "stock_5min", "v1")
-        # 空 DataFrame 没有 columns，所以会报 Missing
         assert valid is False
 
 
@@ -256,13 +544,13 @@ class TestParquetSchema:
 
 class TestGetSchemaForApi:
     def test_returns_full_schema(self, manager):
-        """get_schema_for_api 返回完整 schema（含 fields 详情）"""
+        """get_schema_for_api 返回完整 schema"""
         schema = manager.get_schema_for_api("stock_5min", "v1")
         assert "name" in schema
         assert "version" in schema
-        assert "fields" in schema
-        assert isinstance(schema["fields"], list)
-        assert len(schema["fields"]) > 0
+        assert "data_schema" in schema
+        assert "storage_rule" in schema
+        assert isinstance(schema["data_schema"], dict)
 
     def test_raises_for_unknown(self, manager):
         with pytest.raises(KeyError):
@@ -278,7 +566,6 @@ class TestEdgeCases:
     def test_empty_schemas_dir(self, tmp_path):
         """空目录应加载 0 个 schema（不报错）"""
         from app.schema_manager import SchemaManager
-
         d = tmp_path / "empty_schemas"
         d.mkdir()
         m = SchemaManager(str(d))
@@ -287,7 +574,6 @@ class TestEdgeCases:
     def test_schemas_dir_not_exist(self, tmp_path):
         """目录不存在应加载 0 个 schema（不报错）"""
         from app.schema_manager import SchemaManager
-
         non_exist = tmp_path / "not_exist"
         m = SchemaManager(str(non_exist))
         assert m.list_schemas() == []

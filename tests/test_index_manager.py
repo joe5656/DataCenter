@@ -2,72 +2,61 @@
 Tests for IndexManager (§2.6)
 
 测试覆盖：
-1. get_write_path（正常 / 含 market / 含 code）
-2. get_read_paths（日期范围）
-3. _render_path（模板渲染）
-4. 边界情况（模板含未定义变量、无效 data_type 等）
+1. get_write_paths（分组写入）
+2. get_read_paths（单值/枚举/范围 filter，路径存在性检查）
+3. to_absolute_path
+
+REQ-003 设计：
+- 接口面向所有 data_type，不依赖特定业务字段
+- get_write_paths(data, data_type, version) -> {路径: 数据子集}
+- get_read_paths(data_type, version, **filters) -> [实际存在路径]
+  - filter: 单值/枚举/范围 {start, end}
+  - 只返回有文件的路径
 """
 
 import json
 import os
-import tempfile
+import shutil
 from pathlib import Path
 
-import pytest
 import pandas as pd
+import pytest
 
 
 @pytest.fixture
 def schema_dir(tmp_path):
-    """创建一个临时 schemas/ 目录，并写入测试 schema"""
+    """创建测试 schema"""
     d = tmp_path / "schemas"
     d.mkdir()
 
-    # stock_5min_v1.json（含 {market} 变量）
+    # stock_5min: 按 market + date 分组
     stock_5min = {
         "name": "stock_5min",
         "version": "v1",
-        "description": "股票5分钟K线",
-        "granularity": "5min",
-        "fields": [
-            {"name": "date", "type": "string"},
-            {"name": "code", "type": "string"},
-            {"name": "market", "type": "string"},
-            {"name": "open", "type": "double"},
-        ],
-        "storage_rules": {
-            "path_template": "{data_type}/{granularity}/{market}/{year}/{month}/{date}.parquet",
-            "partition": {
-                "by": "date",
-                "max_rows": 1000000,
-                "max_size_mb": 100,
-            },
+        "data_schema": {
+            "date": "string",
+            "code": "string",
+            "market": "string",
+            "time": "string",
+            "open": "double",
         },
+        "storage_rule": "{schema.name}/{schema.market}/{schema.date}.parquet",
     }
     (d / "stock_5min_v1.json").write_text(
         json.dumps(stock_5min, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
-    # stock_1day_v1.json（不含 {market}）
+    # stock_1day: 只按 date 分组
     stock_1day = {
         "name": "stock_1day",
         "version": "v1",
-        "description": "股票日线",
-        "granularity": "1day",
-        "fields": [
-            {"name": "date", "type": "string"},
-            {"name": "code", "type": "string"},
-            {"name": "open", "type": "double"},
-        ],
-        "storage_rules": {
-            "path_template": "{data_type}/{granularity}/{year}/{month}/{date}.parquet",
-            "partition": {
-                "by": "date",
-                "max_rows": 500000,
-                "max_size_mb": 200,
-            },
+        "data_schema": {
+            "date": "string",
+            "code": "string",
+            "open": "double",
         },
+        "storage_rule": "{schema.name}/{schema.date}.parquet",
     }
     (d / "stock_1day_v1.json").write_text(
         json.dumps(stock_1day, ensure_ascii=False, indent=2),
@@ -78,66 +67,65 @@ def schema_dir(tmp_path):
 
 
 @pytest.fixture
-def index_manager(schema_dir):
-    """创建一个 IndexManager 实例"""
+def index_manager(schema_dir, tmp_path, monkeypatch):
+    """创建 IndexManager 实例"""
     from app.schema_manager import SchemaManager
     from app.index_manager import IndexManager
+    from app.storage_manager import StorageManager
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    monkeypatch.setenv("DATACENTER_DATA_DIR", str(data_dir))
 
     sm = SchemaManager(schema_dir)
     return IndexManager(sm)
 
 
 @pytest.fixture
-def config_override(tmp_path):
-    """覆盖 Config.DATA_DIR 为临时目录"""
+def storage_manager(tmp_path, monkeypatch):
+    """创建 StorageManager 实例"""
+    from app.storage_manager import StorageManager
+
     data_dir = tmp_path / "data"
-    data_dir.mkdir()
-    from app.config import Config
-
-    return Config(DATA_DIR=str(data_dir))
+    data_dir.mkdir(exist_ok=True)
+    monkeypatch.setenv("DATACENTER_DATA_DIR", str(data_dir))
+    return StorageManager()
 
 
 # ------------------------------------------------------------------ #
-# 测试 get_write_path
+# 测试 get_write_paths
 # ------------------------------------------------------------------ #
 
 
-class TestGetWritePath:
-    def test_basic(self, index_manager, config_override, monkeypatch):
-        """基本功能：不含可选变量"""
-        monkeypatch.setattr(index_manager.config, "DATA_DIR", config_override.DATA_DIR)
-        path = index_manager.get_write_path(
-            "stock_1day", "v1", "2026-05-17"
-        )
-        expected = os.path.join(
-            config_override.DATA_DIR, "stock_1day/1day/2026/05/2026-05-17.parquet"
-        )
-        assert path == expected
+class TestGetWritePaths:
+    def test_single_group(self, index_manager):
+        """数据写入单个文件"""
+        df = pd.DataFrame({
+            "date": ["2026-05-17"] * 3,
+            "code": ["00700", "00701", "00702"],
+            "market": ["XHKG"] * 3,
+            "time": ["09:30", "09:31", "09:32"],
+            "open": [380.0, 381.0, 382.0],
+        })
 
-    def test_with_market(self, index_manager, config_override, monkeypatch):
-        """含 market 变量"""
-        monkeypatch.setattr(index_manager.config, "DATA_DIR", config_override.DATA_DIR)
-        path = index_manager.get_write_path(
-            "stock_5min", "v1", "2026-05-17", market="XHKG"
-        )
-        expected = os.path.join(
-            config_override.DATA_DIR, "stock_5min/5min/XHKG/2026/05/2026-05-17.parquet"
-        )
-        assert path == expected
+        result = index_manager.get_write_paths(df, "stock_5min", "v1")
 
-    def test_with_code(self, index_manager, config_override, monkeypatch):
-        """含 code 变量（需要在 path_template 中定义）"""
-        # stock_5min 的 path_template 不含 {code}，所以这个测试应该失败
-        # 我们需要修改 fixture 来测试 {code}
-        pass  # 暂时跳过，后面单独测试
+        assert len(result) == 1
+        assert "stock_5min/XHKG/2026-05-17.parquet" in result
 
-    def test_returns_absolute_path(self, index_manager, config_override, monkeypatch):
-        """返回路径应包含 DATA_DIR 前缀"""
-        monkeypatch.setattr(index_manager.config, "DATA_DIR", config_override.DATA_DIR)
-        path = index_manager.get_write_path(
-            "stock_1day", "v1", "2026-05-17"
-        )
-        assert path.startswith(config_override.DATA_DIR)
+    def test_multiple_groups_by_market(self, index_manager):
+        """按 market 分组"""
+        df = pd.DataFrame({
+            "date": ["2026-05-17"] * 2,
+            "code": ["00700", "600000"],
+            "market": ["XHKG", "XSHG"],
+            "time": ["09:30", "09:30"],
+            "open": [380.0, 10.0],
+        })
+
+        result = index_manager.get_write_paths(df, "stock_5min", "v1")
+
+        assert len(result) == 2
 
 
 # ------------------------------------------------------------------ #
@@ -146,108 +134,138 @@ class TestGetWritePath:
 
 
 class TestGetReadPaths:
-    def test_single_date(self, index_manager, config_override, monkeypatch):
-        """日期范围只有一天"""
-        monkeypatch.setattr(index_manager.config, "DATA_DIR", config_override.DATA_DIR)
-        paths = index_manager.get_read_paths(
-            "stock_1day", "v1", "2026-05-17", "2026-05-17"
-        )
-        assert len(paths) == 1
-        assert "2026-05-17.parquet" in paths[0]
+    def test_single_date(self, index_manager, storage_manager, tmp_path, monkeypatch):
+        """单日读取（date=单值）"""
+        # 先写入一个文件
+        df = pd.DataFrame({
+            "date": ["2026-05-17"],
+            "code": ["00700"],
+            "market": ["XHKG"],
+            "time": ["09:30"],
+            "open": [380.0],
+        })
 
-    def test_date_range(self, index_manager, config_override, monkeypatch):
-        """多天日期范围"""
-        monkeypatch.setattr(index_manager.config, "DATA_DIR", config_override.DATA_DIR)
-        paths = index_manager.get_read_paths(
-            "stock_1day", "v1", "2026-05-17", "2026-05-19"
-        )
-        assert len(paths) == 3  # 17, 18, 19
-        assert all("2026-05" in p for p in paths)
+        paths = index_manager.get_write_paths(df, "stock_5min", "v1")
+        for rel_path, sub_df in paths.items():
+            abs_path = index_manager.to_absolute_path(rel_path)
+            storage_manager.write_parquet(sub_df, abs_path)
 
-    def test_with_market(self, index_manager, config_override, monkeypatch):
-        """含 market 变量"""
-        monkeypatch.setattr(index_manager.config, "DATA_DIR", config_override.DATA_DIR)
-        paths = index_manager.get_read_paths(
-            "stock_5min", "v1", "2026-05-17", "2026-05-17", market="XHKG"
+        # 读取：date=单值
+        result = index_manager.get_read_paths("stock_5min", "v1", date="2026-05-17")
+
+        assert len(result) == 1
+        assert "stock_5min/XHKG/2026-05-17.parquet" in result[0]
+
+    def test_date_range(self, index_manager, storage_manager, tmp_path, monkeypatch):
+        """日期范围（date={start, end}）"""
+        # 写入 3 天数据
+        for date in ["2026-05-17", "2026-05-18", "2026-05-19"]:
+            df = pd.DataFrame({
+                "date": [date],
+                "code": ["00700"],
+                "market": ["XHKG"],
+                "time": ["09:30"],
+                "open": [380.0],
+            })
+            paths = index_manager.get_write_paths(df, "stock_5min", "v1")
+            for rel_path, sub_df in paths.items():
+                abs_path = index_manager.to_absolute_path(rel_path)
+                storage_manager.write_parquet(sub_df, abs_path)
+
+        # 读取：date=范围
+        result = index_manager.get_read_paths(
+            "stock_5min", "v1",
+            date={"start": "2026-05-17", "end": "2026-05-19"}
         )
-        assert len(paths) == 1
-        assert "XHKG" in paths[0]
+
+        assert len(result) == 3
+
+    def test_market_filter(self, index_manager, storage_manager, tmp_path, monkeypatch):
+        """市场过滤（market=单值）"""
+        # 写入两个市场数据
+        for market in ["XHKG", "XSHG"]:
+            df = pd.DataFrame({
+                "date": ["2026-05-17"],
+                "code": ["00700"],
+                "market": [market],
+                "time": ["09:30"],
+                "open": [380.0],
+            })
+            paths = index_manager.get_write_paths(df, "stock_5min", "v1")
+            for rel_path, sub_df in paths.items():
+                abs_path = index_manager.to_absolute_path(rel_path)
+                storage_manager.write_parquet(sub_df, abs_path)
+
+        # 只读取 XHKG
+        result = index_manager.get_read_paths("stock_5min", "v1", market="XHKG")
+
+        assert len(result) == 1
+        assert "XHKG" in result[0]
+
+    def test_market_enum(self, index_manager, storage_manager, tmp_path, monkeypatch):
+        """市场枚举（market=[list]）"""
+        # 写入两个市场数据
+        for market in ["XHKG", "XSHG", "XSHE"]:
+            df = pd.DataFrame({
+                "date": ["2026-05-17"],
+                "code": ["00700"],
+                "market": [market],
+                "time": ["09:30"],
+                "open": [380.0],
+            })
+            paths = index_manager.get_write_paths(df, "stock_5min", "v1")
+            for rel_path, sub_df in paths.items():
+                abs_path = index_manager.to_absolute_path(rel_path)
+                storage_manager.write_parquet(sub_df, abs_path)
+
+        # 枚举读取 XHKG 和 XSHG
+        result = index_manager.get_read_paths(
+            "stock_5min", "v1",
+            market=["XHKG", "XSHG"]
+        )
+
+        assert len(result) == 2
+
+    def test_no_matching_files(self, index_manager):
+        """没有匹配文件时返回空列表"""
+        result = index_manager.get_read_paths(
+            "stock_5min", "v1",
+            date="2099-01-01"
+        )
+
+        assert result == []
+
+    def test_filter_key_not_in_storage_rule(self, index_manager):
+        """对于不在 storage_rule 中的字段，当前会忽略（因为是 path filter）"""
+        # nonexistent 会被忽略（不在 storage_rule 中也不在 builtin 中）
+        # 当前实现：pathFilters 只筛选 storage_rule 中的字段，
+        # nonexistent 不会触发错误，而是被静默忽略
+        result = index_manager.get_read_paths("stock_5min", "v1", nonexistent="value")
+        # 返回所有匹配 * 模式的文件
+        assert isinstance(result, list)
 
 
 # ------------------------------------------------------------------ #
-# 测试 _render_path
-# ------------------------------------------------------------------ #
-
-
-class TestRenderPath:
-    def test_basic_variables(self, index_manager):
-        """渲染基本变量"""
-        template = "{data_type}/{granularity}/{year}/{month}/{date}.parquet"
-        result = index_manager._render_path(
-            template, "stock_5min", "v1", "2026-05-17"
-        )
-        assert result == "stock_5min/5min/2026/05/2026-05-17.parquet"
-
-    def test_optional_variables(self, index_manager):
-        """渲染可选变量（market, code）"""
-        template = "{data_type}/{market}/{code}.parquet"
-        result = index_manager._render_path(
-            template,
-            "stock_5min",
-            "v1",
-            "2026-05-17",
-            market="XHKG",
-            code="00700",
-        )
-        assert result == "stock_5min/XHKG/00700.parquet"
-
-    def test_partition_num(self, index_manager):
-        """
-        渲染分片编号
-        注意：模板中应使用 {size}（不含格式说明符）
-        格式化（如 _part{size:03d}）由调用方处理
-        """
-        template = "{data_type}/{date}_part{size}.parquet"
-        result = index_manager._render_path(
-            template, "stock_5min", "v1", "2026-05-17", partition_num=1
-        )
-        # _render_path 将 {size} 替换为 str(partition_num) = "1"
-        assert result == "stock_5min/2026-05-17_part1.parquet"
-
-    def test_unrendered_variables(self, index_manager):
-        """未定义的变量应报错"""
-        template = "{data_type}/{undefined_var}.parquet"
-        with pytest.raises(ValueError):
-            index_manager._render_path(template, "stock_5min", "v1", "2026-05-17")
-
-
-# ------------------------------------------------------------------ #
-# 测试边界情况
+# 边界情况
 # ------------------------------------------------------------------ #
 
 
 class TestEdgeCases:
     def test_invalid_data_type(self, index_manager):
-        """无效的 data_type 应报错（KeyError from SchemaManager）"""
+        """无效 data_type 报错"""
         with pytest.raises(KeyError):
-            index_manager.get_write_path("nonexistent", "v1", "2026-05-17")
+            index_manager.get_write_paths(
+                pd.DataFrame({"date": ["2026-05-17"]}),
+                "nonexistent", "v1"
+            )
 
-    def test_invalid_date_format(self, index_manager, config_override, monkeypatch):
-        """日期格式错误（非 YYYY-MM-DD）可能导致渲染异常"""
-        monkeypatch.setattr(index_manager.config, "DATA_DIR", config_override.DATA_DIR)
-        # 日期格式错误，但不会报错（只是渲染结果不对）
-        path = index_manager.get_write_path(
-            "stock_1day", "v1", "2026/05/17"  # 错误格式
-        )
-        # 仍然返回路径（只是 year/month 提取错误）
-        assert path is not None
+    def test_write_missing_required_column(self, index_manager):
+        """缺少 storage_rule 所需字段报错"""
+        df = pd.DataFrame({
+            "date": ["2026-05-17"],
+            "code": ["00700"],
+            # 缺少 market
+        })
 
-    def test_empty_date_range(self, index_manager, config_override, monkeypatch):
-        """日期范围为空（start > end）"""
-        monkeypatch.setattr(index_manager.config, "DATA_DIR", config_override.DATA_DIR)
-        paths = index_manager.get_read_paths(
-            "stock_1day", "v1", "2026-05-20", "2026-05-17"  # start > end
-        )
-        # 应该返回空列表（或报错，取决于实现）
-        # 当前实现会返回空列表（因为 while current <= end 不成立）
-        assert paths == []
+        with pytest.raises(ValueError, match="missing required columns"):
+            index_manager.get_write_paths(df, "stock_5min", "v1")

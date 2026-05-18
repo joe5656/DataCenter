@@ -178,11 +178,11 @@ DataCenter/
 
 **示例 —— stock_5min 的 path_template**：
 ```
-{data_dir}/{data_type}/{granularity}/```
+{data_type}/{granularity}/```
 
 **示例 —— stock_1day 的 path_template**（不同颗粒度，不同路径）：
 ```
-{data_dir}/{data_type}/{granularity}/```
+{data_type}/{granularity}/```
 
 #### 2.4.1 目录结构（示例）
 
@@ -302,7 +302,7 @@ data/
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `path_template` | string | ✅ | 路径模板，支持原语 `{data_dir}` `{data_type}` `{granularity}` `{year}` `{month}` `{date}` `{market}` `{code}` |
+| `path_template` | string | ✅ | 路径模板，支持原语 `{data_type}` `{granularity}` `{year}` `{month}` `{date}` `{market}` `{code}` |
 | `partition.by` | string | ✅ | 分片依据（`date`=按天，`code`=按股票） |
 | `partition.max_rows` | int | ✅ | 单文件最大行数 |
 | `partition.max_size_mb` | int | ✅ | 单文件最大大小（MB） |
@@ -313,7 +313,7 @@ data/
 |----------|-------------|
 | `stock_5min` | `{data_type}/{granularity}/{year}/{month}/{date}.parquet` |
 | `stock_1day` | `{data_type}/{granularity}/{year}/{month}/{date}.parquet` |
-| `index_weight` | `{data_dir}/{data_type}/{year}/{month}/{date}.parquet` |
+| `index_weight` | `{data_type}/{year}/{month}/{date}.parquet` |
 
 ---
 

@@ -2,187 +2,305 @@
 Index Manager - 索引管理模块（路径计算）
 
 职责：
-1. 根据 schema 的 storage_rules.path_template 计算读写路径
-2. 支持按日期范围列出文件路径（读路径）
-3. 【暂不实现】分片（partition）逻辑 — 由 DataProcessor 处理
-4. 无状态，纯路径计算（不读写文件）
+1. 根据 schema 的 storage_rule 和数据计算写入路径
+2. 支持按过滤条件计算读取路径（枚举/范围/单值）
+3. 扫描实际存储，返回存在文件的路径
 
-设计原则：路径计算逻辑与 I/O 分离，便于测试和扩展。
+REQ-003 设计原则（续）：
+- get_write_paths(data, data_type, version) -> Dict[str, DataFrame]
+- get_read_paths(data_type, version, **filters) -> List[str]
+  - filter 的 key 必须是 storage_rule 中的字段
+  - filter 值类型：枚举 [a,b] / 单值 a / 范围 {start, end}
+  - 返回实际存在文件的路径
 """
 
+import glob
 import os
+import re
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
+
+import pandas as pd
 
 from app.config import Config
 from app.schema_manager import SchemaManager
+
+
+# Filter 值类型
+FilterValue = Union[str, List[str], Dict[str, str]]  # 单值、枚举、范围
 
 
 class IndexManager:
     """索引管理器（路径计算）"""
 
     def __init__(self, schema_manager: SchemaManager):
-        """
-        初始化索引管理器
-
-        Args:
-            schema_manager: SchemaManager 实例（用于获取 storage_rules）
-        """
         self.schema_manager = schema_manager
         self.config = Config()
 
-    def get_write_path(
+    # ------------------------------------------------------------------ #
+    # 写入路径计算
+    # ------------------------------------------------------------------ #
+
+    def get_write_paths(
         self,
+        data: pd.DataFrame,
         data_type: str,
-        version: str,
-        date: str,
-        market: Optional[str] = None,
-        code: Optional[str] = None,
-    ) -> str:
+        version: str = "v1",
+    ) -> Dict[str, pd.DataFrame]:
         """
-        计算写入路径（单文件）
+        根据 storage_rule 计算写入路径，并按路径分组数据。
 
         Args:
-            data_type: 数据类型（如 stock_5min）
-            version: 版本号（如 v1）
-            date: 日期（如 2026-05-17）
-            market: 市场（可选，如 XHKG）
-            code: 股票代码（可选，如 00700）
+            data: 待写入的 DataFrame
+            data_type: 数据类型
+            version: 版本号
 
         Returns:
-            完整文件路径（含 DATA_DIR 前缀）
+            {相对路径: 数据子集} 映射
         """
-        storage_rules = self.schema_manager.get_storage_rules(data_type, version)
-        path_template = storage_rules["path_template"]
-        rendered = self._render_path(path_template, data_type, version, date, market, code)
-        return os.path.join(self.config.DATA_DIR, rendered)
+        if data.empty:
+            return {}
+
+        storage_rule = self.schema_manager.get_storage_rule(data_type, version)
+        refs = self._extract_path_refs(storage_rule)
+
+        # 检查数据是否包含所需字段
+        missing = [ref for ref in refs if ref not in data.columns]
+        if missing:
+            raise ValueError(f"Data missing required columns for storage_rule: {missing}")
+
+        # 按路径字段分组
+        group_cols = [ref for ref in refs if ref in data.columns]
+        if not group_cols:
+            rendered = self._render_path(storage_rule, {}, data_type, version, {})
+            return {rendered: data}
+
+        result = {}
+        for group_values, group_df in data.groupby(group_cols, dropna=False):
+            if not isinstance(group_values, tuple):
+                group_values = (group_values,)
+            row_data = dict(zip(group_cols, group_values))
+            rendered = self._render_path(storage_rule, row_data, data_type, version, row_data)
+            result[rendered] = group_df
+
+        return result
+
+    def _extract_path_refs(self, storage_rule: str) -> List[str]:
+        """提取 storage_rule 中的字段引用（不含内置）"""
+        refs = []
+        builtin = {"name", "version", "year", "month"}
+        for match in re.finditer(r"\{schema\.(\w+)\}", storage_rule):
+            ref = match.group(1)
+            if ref not in builtin and ref not in refs:
+                refs.append(ref)
+        return refs
+
+    def _render_path(
+        self,
+        storage_rule: str,
+        row_or_filter: Dict[str, Any],
+        data_type: str,
+        version: str,
+        data_row: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """渲染路径"""
+        result = storage_rule
+        result = result.replace("{schema.name}", data_type)
+        result = result.replace("{schema.version}", version)
+
+        if data_row is None:
+            data_row = {}
+
+        # year/month 从 date 提取
+        if "date" in data_row and data_row["date"]:
+            date_str = str(data_row["date"])
+            if len(date_str) >= 10:
+                result = result.replace("{schema.year}", date_str[:4])
+                result = result.replace("{schema.month}", date_str[5:7])
+
+        # 数据引用
+        for key, value in data_row.items():
+            placeholder = "{schema." + key + "}"
+            result = result.replace(placeholder, str(value) if value is not None else "")
+
+        return result
+
+    # ------------------------------------------------------------------ #
+    # 读取路径计算
+    # ------------------------------------------------------------------ #
 
     def get_read_paths(
         self,
         data_type: str,
-        version: str,
-        start_date: str,
-        end_date: str,
-        market: Optional[str] = None,
+        version: str = "v1",
+        **filters: FilterValue,
     ) -> List[str]:
         """
-        计算读取路径（日期范围内所有文件）
+        根据过滤条件计算读取路径。
 
-        Args:
-            data_type: 数据类型
-            version: 版本号
-            start_date: 开始日期（含，YYYY-MM-DD）
-            end_date: 结束日期（含，YYYY-MM-DD）
-            market: 市场（可选）
+        filter 的 key 必须是 storage_rule 中定义的字段。
+        - 路径过滤字段（storage_rule 包含）：market, date 等
+        - 行级过滤字段（不含）：code 等 → 在 read_data 中读取后过滤
 
-        Returns:
-            完整文件路径列表（按日期排序）
+        filter 值类型：
+        - 单值/枚举/范围
         """
-        storage_rules = self.schema_manager.get_storage_rules(data_type, version)
-        path_template = storage_rules["path_template"]
+        storage_rule = self.schema_manager.get_storage_rule(data_type, version)
 
-        dates = self._generate_dates(start_date, end_date)
-        paths = []
-        for date in dates:
-            rendered = self._render_path(path_template, data_type, version, date, market)
-            full_path = os.path.join(self.config.DATA_DIR, rendered)
-            paths.append(full_path)
+        # 提取 storage_rule 中真正需要用户提供的字段（不含 builtin）
+        rule_fields = set(self._extract_path_refs(storage_rule))
 
-        return paths
+        # 只保留在 storage_rule 中的 filter（路径过滤）
+        path_filters = {k: v for k, v in filters.items() if k in rule_fields}
 
-    # ------------------------------------------------------------------ #
-    # get_partition_paths —— 暂未实现
-    # 分区逻辑由 DataProcessor 根据业务需求处理
-    # ------------------------------------------------------------------ #
+        # 生成候选路径（使用 path_filters）
+        candidate_patterns = self._generate_candidate_patterns(storage_rule, data_type, version, path_filters)
 
-    def _render_path(
+        # 扫描并检查存在性
+        existing_paths = []
+        for pattern in candidate_patterns:
+            abs_pattern = self.to_absolute_path(pattern)
+            matched = glob.glob(abs_pattern)
+            for abs_path in matched:
+                rel_path = os.path.relpath(abs_path, self.config.DATA_DIR)
+                existing_paths.append(rel_path)
+
+        return existing_paths
+
+    def _generate_candidate_patterns(
         self,
-        path_template: str,
+        storage_rule: str,
         data_type: str,
         version: str,
-        date: str,
-        market: Optional[str] = None,
-        code: Optional[str] = None,
-        partition_num: Optional[int] = None,
-    ) -> str:
+        filters: Dict[str, FilterValue],
+    ) -> List[str]:
         """
-        渲染 path_template
+        生成候选路径模式（glob 风格）。
 
-        支持的变量：
-        - {data_type}: schema name
-        - {granularity}: schema granularity
-        - {year}: date[:4]
-        - {month}: date[5:7]
-        - {date}: date
-        - {market}: market (optional)
-        - {code}: code (optional)
-        - {size}: partition number（不含格式说明符，调用方负责格式化）
-
-        Args:
-            path_template: 路径模板
-            data_type: 数据类型
-            version: 版本号
-            date: 日期
-            market: 市场（可选）
-            code: 代码（可选）
-            partition_num: 分片编号（可选，整数）
-
-        Returns:
-            渲染后的相对路径
-
-        Raises:
-            ValueError: 必填变量未填充（可选变量可以留在模板中）
+        处理逻辑：
+        - date 范围：展开为具体日期列表
+        - date 枚举：直接用枚举值
+        - date 单值：直接用值
+        - 其他字段（market/code等）：支持枚举/单值
+        - 无 filter 的字段：用 * 通配符
         """
-        granularity = self.schema_manager.get_granularity(data_type, version)
+        patterns = []
 
-        variables = {
-            "data_type": data_type,
-            "granularity": granularity,
-            "year": date[:4],
-            "month": date[5:7],
-            "date": date,
-        }
-        if market is not None:
-            variables["market"] = market
-        if code is not None:
-            variables["code"] = code
-        if partition_num is not None:
-            # 注意：模板中应使用 {size}，调用方负责格式化（如 _part{size:03d}）
-            variables["size"] = str(partition_num)  # 字符串，调用方自行格式化
+        # 处理 date
+        if "date" in filters:
+            date_filter = filters["date"]
+            if isinstance(date_filter, dict) and "start" in date_filter:
+                dates = self._generate_date_range(date_filter["start"], date_filter["end"])
+            elif isinstance(date_filter, list):
+                dates = date_filter
+            elif isinstance(date_filter, str):
+                dates = [date_filter]
+            else:
+                dates = []
+        else:
+            dates = [None]  # 无 date filter，用通配符
 
-        # 渲染模板（简单 replace，不支持复杂表达式）
-        result = path_template
-        for key, value in variables.items():
-            placeholder = "{" + key + "}"
-            result = result.replace(placeholder, value)
+        # 处理其他 filters
+        other = {k: v for k, v in filters.items() if k != "date"}
 
-        # 检查是否还有未渲染的 {xxx}（可选变量允许存在，必填变量应报错）
-        import re
-        remaining = re.findall(r"\{([^}]+)\}", result)
-        if remaining:
-            # 有未渲染的变量，可能是可选变量，暂不允许（让调用方显式处理）
-            raise ValueError(f"Unrendered variables in path_template: {remaining}")
+        # 对于 other 中的每个字段，展开为值列表
+        other_expanded = []
+        if not other:
+            other_expanded = [{}]
+        else:
+            for key, value in other.items():
+                if value is None:
+                    values = [None]
+                elif isinstance(value, list):
+                    values = value
+                else:
+                    values = [value]
+
+                if not other_expanded:
+                    other_expanded = [{key: v} for v in values]
+                else:
+                    new_expanded = []
+                    for existing in other_expanded:
+                        for v in values:
+                            new_expanded.append({**existing, key: v})
+                    other_expanded = new_expanded
+
+        # 构建笛卡尔积
+        for date in dates:
+            for o in other_expanded:
+                combo = dict(o)
+                if date:
+                    combo["date"] = date
+                pattern = self._render_glob_pattern(storage_rule, data_type, version, combo)
+                if pattern:
+                    patterns.append(pattern)
+
+        # 如果没有任何 filter，用 * 扫描
+        if not patterns:
+            patterns = [self._render_glob_pattern(storage_rule, data_type, version, {})]
+
+        return patterns
+
+    def _render_glob_pattern(
+        self,
+        storage_rule: str,
+        data_type: str,
+        version: str,
+        filter_: Dict[str, Any],
+    ) -> Optional[str]:
+        """渲染为 glob 模式（未提供的字段用 *）"""
+        result = storage_rule
+        result = result.replace("{schema.name}", data_type)
+        result = result.replace("{schema.version}", version)
+
+        # date 处理
+        if "date" in filter_ and filter_["date"]:
+            date_str = str(filter_["date"])
+            result = result.replace("{schema.date}", date_str)
+            if len(date_str) >= 10:
+                result = result.replace("{schema.year}", date_str[:4])
+                result = result.replace("{schema.month}", date_str[5:7])
+        else:
+            # date 未指定，用通配符
+            result = result.replace("{schema.date}", "*")
+            result = result.replace("{schema.year}", "*")
+            result = result.replace("{schema.month}", "*")
+
+        # 其他字段
+        for key in ["market", "code", "size"]:
+            placeholder = "{schema." + key + "}"
+            if placeholder in result:
+                if key in filter_ and filter_[key]:
+                    result = result.replace(placeholder, str(filter_[key]))
+                else:
+                    result = result.replace(placeholder, "*")
 
         return result
 
-    def _generate_dates(self, start_date: str, end_date: str) -> List[str]:
-        """
-        生成日期范围内所有日期（含起止）
-
-        Args:
-            start_date: 开始日期（YYYY-MM-DD）
-            end_date: 结束日期（YYYY-MM-DD）
-
-        Returns:
-            日期字符串列表（YYYY-MM-DD）
-        """
-        start = datetime.strptime(start_date, "%Y-%m-%d")
-        end = datetime.strptime(end_date, "%Y-%m-%d")
+    def _generate_date_range(self, start: str, end: str) -> List[str]:
+        """生成日期范围内的所有日期"""
+        s = datetime.strptime(start, "%Y-%m-%d")
+        e = datetime.strptime(end, "%Y-%m-%d")
 
         dates = []
-        current = start
-        while current <= end:
+        current = s
+        while current <= e:
             dates.append(current.strftime("%Y-%m-%d"))
             current += timedelta(days=1)
-
         return dates
+
+    # ------------------------------------------------------------------ #
+    # 辅助方法
+    # ------------------------------------------------------------------ #
+
+    def to_absolute_path(self, relative_path: str) -> str:
+        """相对路径转绝对路径"""
+        return os.path.join(self.config.DATA_DIR, relative_path)
+
+    @property
+    def storage_manager(self):
+        """懒加载 StorageManager"""
+        if not hasattr(self, "_storage_manager"):
+            from app.storage_manager import StorageManager
+            self._storage_manager = StorageManager()
+        return self._storage_manager

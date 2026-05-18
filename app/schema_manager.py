@@ -6,7 +6,25 @@ Schema Manager - Schema 加载、验证、管理模块
 2. 根据数据类型和版本获取 schema
 3. 验证数据是否符合 schema
 4. 将 JSON schema 转换为 PyArrow Schema
-5. 提供 storage_rules 给 IndexManager 使用
+5. 提供 storage_rule 给 IndexManager 使用
+
+REQ-003 schema 格式规范：
+{
+    "name": "stock_5min",
+    "version": "v1",
+    "data_schema": {
+        "date": "string",
+        "code": "string",
+        ...
+    },
+    "storage_rule": "{schema.name}/{schema.date}.parquet"
+}
+
+合法性检查：
+- 必须包含 name / version / data_schema / storage_rule 四个标准字段
+- data_schema 必须是 key-value 键值对，不允许更深嵌套
+- storage_rule 中 {schema.xxx} 引用的 xxx 必须在 data_schema 里有定义
+- storage_rule 必须以 .parquet 结尾
 
 设计原则：启动时一次性加载所有 schema，运行时不可变。
 新增数据类型 = 新 JSON 文件 + 新版本 Docker 镜像。
@@ -15,7 +33,6 @@ Schema Manager - Schema 加载、验证、管理模块
 import json
 import os
 import re
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -64,18 +81,17 @@ class SchemaManager:
         if not os.path.isdir(self.schemas_dir):
             return
 
-        for filename in os.listdir(self.schemas_dir):
+        for filename in sorted(os.listdir(self.schemas_dir)):
             if not filename.endswith(".json"):
                 continue
-            # 只加载符合 {name}_v{version}.json 命名规范的文件
-            if not re.match(r"^.+\_v[a-zA-Z0-9]+\.json$", filename):
+            if not re.match(r"^.+_v[a-zA-Z0-9]+\.json$", filename):
                 continue
 
             filepath = os.path.join(self.schemas_dir, filename)
             try:
                 with open(filepath, "r", encoding="utf-8") as f:
                     schema = json.load(f)
-                self._validate_schema_structure(schema, filename)
+                self._validate_schema(schema, filename)
                 key = (schema["name"], schema["version"])
                 self._schemas[key] = schema
                 self._pyarrow_schemas[key] = self._build_pyarrow_schema(schema, filename)
@@ -84,37 +100,96 @@ class SchemaManager:
                 warnings.warn(f"Failed to load schema {filename}: {e}")
                 continue
 
-    def _validate_schema_structure(self, schema: Dict[str, Any], filename: str) -> None:
+    # ------------------------------------------------------------------ #
+    # 验证逻辑
+    # ------------------------------------------------------------------ #
+
+    def _validate_schema(self, schema: Dict[str, Any], filename: str) -> None:
         """
-        验证 schema JSON 结构是否合法。
+        验证 schema 是否符合 REQ-003 规范。
+
+        检查项：
+        1. 必须包含 name / version / data_schema / storage_rule
+        2. data_schema 必须是 key-value 键值对（str -> str），不允许嵌套
+        3. data_schema 的 value 必须是合法类型
+        4. storage_rule 必须是字符串且以 .parquet 结尾
+        5. storage_rule 中 {schema.xxx} 引用的 xxx 必须在 data_schema 里有定义
 
         Raises:
-            ValueError: 缺少必填字段或字段定义不合法
+            ValueError: 任一检查不通过
         """
-        required = ["name", "version", "granularity", "fields", "storage_rules"]
+        # 1. 必填字段检查
+        required = ["name", "version", "data_schema", "storage_rule"]
         for field in required:
             if field not in schema:
                 raise ValueError(f"{filename}: missing required field '{field}'")
 
-        if not isinstance(schema["fields"], list):
-            raise ValueError(f"{filename}: 'fields' must be a list")
+        # 2. data_schema 必须是 dict，且 key-value 均为字符串
+        ds = schema["data_schema"]
+        if not isinstance(ds, dict):
+            raise ValueError(f"{filename}: 'data_schema' must be a key-value dict, got {type(ds).__name__}")
+        if len(ds) == 0:
+            raise ValueError(f"{filename}: 'data_schema' must not be empty")
 
-        for i, f in enumerate(schema["fields"]):
-            if "name" not in f or "type" not in f:
-                raise ValueError(f"{filename}: fields[{i}] missing 'name' or 'type'")
-            if f["type"] not in _TYPE_MAP:
-                raise ValueError(f"{filename}: fields[{i}] unsupported type '{f['type']}'")
+        for key, value in ds.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                raise ValueError(
+                    f"{filename}: data_schema entries must be str->str, "
+                    f"got {type(key).__name__}->{type(value).__name__} for '{key}'"
+                )
+            # 嵌套检查：value 不能是 dict/list（虽然 isinstance 已排除，但显式检查）
+            if value.startswith("{") or value.startswith("["):
+                raise ValueError(f"{filename}: data_schema['{key}'] must be a flat type string, not nested")
 
-        # 验证 storage_rules
-        sr = schema["storage_rules"]
-        if "path_template" not in sr or "partition" not in sr:
-            raise ValueError(f"{filename}: storage_rules missing 'path_template' or 'partition'")
-        if "by" not in sr["partition"] or "max_rows" not in sr["partition"] or "max_size_mb" not in sr["partition"]:
-            raise ValueError(f"{filename}: storage_rules.partition missing required fields")
+        # 3. data_schema 的 value 必须是合法类型
+        for key, value in ds.items():
+            if value not in _TYPE_MAP:
+                raise ValueError(f"{filename}: data_schema['{key}'] has unsupported type '{value}'")
+
+        # 4. storage_rule 必须是字符串且以 .parquet 结尾
+        sr = schema["storage_rule"]
+        if not isinstance(sr, str):
+            raise ValueError(f"{filename}: 'storage_rule' must be a string, got {type(sr).__name__}")
+        if not sr.endswith(".parquet"):
+            raise ValueError(f"{filename}: 'storage_rule' must end with '.parquet', got '{sr}'")
+
+        # 5. storage_rule 中 {schema.xxx} 引用的 xxx 必须在 data_schema 里有定义
+        #    例外：
+        #    - name 和 version 是 schema 元数据
+        #    - year 和 month 是从 date 动态提取的
+        builtin_refs = {"name", "version", "year", "month"}
+        schema_refs = self._extract_schema_refs(sr)
+        for ref in schema_refs:
+            if ref in builtin_refs:
+                continue
+            if ref not in ds:
+                raise ValueError(
+                    f"{filename}: storage_rule references '{{schema.{ref}}}' "
+                    f"but '{ref}' is not defined in data_schema"
+                )
+
+    @staticmethod
+    def _extract_schema_refs(path_template: str) -> List[str]:
+        """
+        从路径模板中提取所有 {schema.xxx} 引用的 xxx。
+
+        例如: "{schema.name}/{schema.date}.parquet" -> ["name", "date"]
+
+        Args:
+            path_template: 存储路径模板
+
+        Returns:
+            引用字段名列表
+        """
+        return re.findall(r"\{schema\.(\w+)\}", path_template)
+
+    # ------------------------------------------------------------------ #
+    # PyArrow Schema 构建
+    # ------------------------------------------------------------------ #
 
     def _build_pyarrow_schema(self, schema: Dict[str, Any], filename: str) -> pa.Schema:
         """
-        将 JSON schema 转换为 PyArrow Schema。
+        将 JSON schema 的 data_schema 转换为 PyArrow Schema。
 
         Args:
             schema: 已验证的 schema 字典
@@ -124,9 +199,9 @@ class SchemaManager:
             PyArrow Schema 对象
         """
         fields = []
-        for f in schema["fields"]:
-            pa_type = _TYPE_MAP[f["type"]]
-            fields.append(pa.field(f["name"], pa_type))
+        for name, type_str in schema["data_schema"].items():
+            pa_type = _TYPE_MAP[type_str]
+            fields.append(pa.field(name, pa_type))
         return pa.schema(fields)
 
     # ------------------------------------------------------------------ #
@@ -152,33 +227,33 @@ class SchemaManager:
             raise KeyError(f"Schema not found: {data_type}_{version}")
         return self._schemas[key]
 
-    def get_storage_rules(self, data_type: str, version: str) -> Dict[str, Any]:
+    def get_storage_rule(self, data_type: str, version: str) -> str:
         """
-        获取 storage_rules（供 IndexManager 使用）。
+        获取 storage_rule 路径模板（供 IndexManager 使用）。
 
         Args:
             data_type: 数据类型名称
             version: 版本号
 
         Returns:
-            storage_rules 字典（含 path_template 和 partition）
+            storage_rule 字符串（如 "{schema.name}/{schema.date}.parquet"）
         """
         schema = self.load_schema(data_type, version)
-        return schema["storage_rules"]
+        return schema["storage_rule"]
 
-    def get_granularity(self, data_type: str, version: str) -> str:
+    def get_data_schema(self, data_type: str, version: str) -> Dict[str, str]:
         """
-        获取 schema 的 granularity（供 IndexManager 渲染 path_template 使用）。
+        获取 data_schema（字段名 -> 类型映射）。
 
         Args:
             data_type: 数据类型名称
             version: 版本号
 
         Returns:
-            颗粒度字符串（如 5min、1day）
+            data_schema 字典（如 {"date": "string", "code": "string", ...}）
         """
         schema = self.load_schema(data_type, version)
-        return schema["granularity"]
+        return schema["data_schema"]
 
     def validate_data(self, data: pd.DataFrame, data_type: str, version: str) -> Tuple[bool, List[str]]:
         """
@@ -195,24 +270,14 @@ class SchemaManager:
         schema = self.load_schema(data_type, version)
         errors = []
 
-        # 1. 检查必需字段是否存在
-        required_fields = [f["name"] for f in schema["fields"]]
+        # 检查必需字段是否存在
+        required_fields = list(schema["data_schema"].keys())
         missing = [f for f in required_fields if f not in data.columns]
         if missing:
             errors.append(f"Missing columns: {missing}")
 
         if errors:
             return (False, errors)
-
-        # 2. 类型检查（可选，PyArrow 写入时会自动转换）
-        # 这里只做警告，不阻断写入
-        for f in schema["fields"]:
-            col = f["name"]
-            expected_type = f["type"]
-            if col in data.columns:
-                actual_dtype = str(data[col].dtype)
-                # 这里可以添加更严格的类型检查
-                pass
 
         return (True, [])
 
@@ -237,28 +302,27 @@ class SchemaManager:
         列出所有已加载的 schema（摘要信息）。
 
         Returns:
-            schema 摘要列表 [{"name":, "version":, "granularity":, "description":}, ...]
+            schema 摘要列表
         """
         result = []
         for (name, version), schema in self._schemas.items():
             result.append({
                 "name": name,
                 "version": version,
-                "granularity": schema.get("granularity"),
-                "description": schema.get("description", ""),
-                "fields_count": len(schema.get("fields", [])),
+                "storage_rule": schema.get("storage_rule", ""),
+                "fields_count": len(schema.get("data_schema", {})),
             })
         return result
 
     def get_schema_for_api(self, data_type: str, version: str) -> Dict[str, Any]:
         """
-        获取 schema 详情（供 API /schemas 端点使用）。
+        获取 schema 详情（供 API 端点使用）。
 
         Args:
             data_type: 数据类型名称
             version: 版本号
 
         Returns:
-            完整 schema 字典（含 fields 详情）
+            完整 schema 字典
         """
         return self.load_schema(data_type, version)
