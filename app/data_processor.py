@@ -191,9 +191,14 @@ class DataProcessor:
         # 4. 应用 filters 过滤
         for key, value in filters.items():
             if key in result.columns:
-                if isinstance(value, list):
+                if isinstance(value, dict) and "start" in value and "end" in value:
+                    # 范围过滤
+                    result = result[(result[key] >= value["start"]) & (result[key] <= value["end"])]
+                elif isinstance(value, list):
+                    # 枚举过滤
                     result = result[result[key].isin(value)]
                 else:
+                    # 单值过滤
                     result = result[result[key] == value]
 
         return result
@@ -253,9 +258,29 @@ class DataProcessor:
         """
         # 获取主键字段
         schema = self.schema_manager.load_schema(data_type, version)
-        primary_keys = ["date", "code"]
-        if "time" in schema["data_schema"]:
-            primary_keys.append("time")
+        data_schema = schema["data_schema"]
+
+        # 动态确定主键字段
+        primary_keys = []
+
+        # 查找 date 相关字段（date 或类似名称）
+        date_fields = [k for k in data_schema.keys() if "date" in k.lower()]
+        if date_fields:
+            primary_keys.append(date_fields[0])
+
+        # 查找 code 相关字段（stock_code、code 或类似名称）
+        code_fields = [k for k in data_schema.keys() if "code" in k.lower()]
+        if code_fields:
+            primary_keys.append(code_fields[0])
+
+        # 检查是否有 time 字段
+        time_fields = [k for k in data_schema.keys() if "time" in k.lower()]
+        if time_fields:
+            primary_keys.append(time_fields[0])
+
+        # 确保至少有主键
+        if not primary_keys:
+            primary_keys = list(data_schema.keys())[:2]  # 默认取前两个字段
 
         # 找出重复行（按主键匹配）
         duplicates = new_data.merge(

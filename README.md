@@ -1,200 +1,483 @@
-# DataCenter - 数据管理模块
+# DataCenter - 金融数据存储中心
 
-数据存储层，负责 K 线数据的持久化、读取和格式转换。
+基于 Parquet 格式的金融 K 线数据存储系统，支持多级别、多市场、多日期的数据写入与读取。
 
-## 目录结构
+## 项目结构
 
 ```
 DataCenter/
-├── data_manager.py    # 核心模块：DataManager / DataSchema / DataRecord
-├── data_schema.xml    # 数据格式定义（紧凑存储规范）
-└── README.md          # 本文件
+├── app/                    # 核心模块
+│   ├── config.py           # 配置管理（环境变量/XML/运行时覆盖）
+│   ├── schema_manager.py   # Schema 加载与验证
+│   ├── storage_manager.py  # Parquet 文件 I/O + 文件锁
+│   ├── index_manager.py    # 路径计算与分组
+│   └── data_processor.py   # 读写协调层
+├── schemas/                # Schema 定义（JSON 格式）
+│   ├── stock_5min_v1.json
+│   ├── stock_30min_v1.json
+│   ├── stock_60min_v1.json
+│   └── stock_1day_v1.json
+├── config.xml              # 默认配置文件
+├── tests/                  # 单元测试（144 个测试用例）
+├── CTtest/                 # 集成测试
+│   ├── test_write.py       # 多级别/多天/多市场写入验证
+│   ├── test_filters.py     # Filter 功能测试
+│   └── data/               # 测试数据目录（.gitignore）
+├── test-report.md          # 测试报告
+├── data-types.md           # 数据类型说明书（Schema + Filter 支持）
+├── requirement.md          # 需求文档
+├── design-plan.md          # 设计文档
+└── README.md               # 本文件
 ```
 
-> **说明**：`data/` 目录（存放实际 JSON 数据文件）位于项目根目录，由 DataManager 实例化时通过 `data_dir` 参数指定。结构为 `data/{exchange}/{name}_{code}/{yearMM}.json`。
+## 核心模块
 
-## 核心类
+### Config
 
-### DataSchema
-
-从 `data_schema.xml` 读取字段定义，管理数据文件的格式规范。
+配置管理，支持三级优先级：`runtime override > env vars > XML config > defaults`
 
 ```python
-schema = DataSchema("DataCenter/data_schema.xml")
+from app.config import Config
+
+# 默认配置
+config = Config()
+
+# 环境变量覆盖
+# DATACENTER_DATA_DIR=/path/to/data
+# DATACENTER_COMPRESSION=SNAPPY
+# DATACENTER_ALLOW_DELETE=true
+# DATACENTER_ALLOW_PUT=false
+
+# 运行时覆盖（最高优先级）
+config = Config(overrides={"DATA_DIR": "/custom/path", "COMPRESSION": "GZIP"})
 ```
 
-**属性：**
+**配置项**:
 
-| 属性 | 类型 | 说明 |
-|------|------|------|
-| `root_fields` | `Dict[int, Dict]` | 根节点字段，key 为索引（0-8），value 含 name/type/description |
-| `date_record_fields` | `Dict[int, Dict]` | 日期记录字段（date + day_data） |
-| `minute_record_fields` | `Dict[int, Dict]` | 分钟级 K 线字段（time/open/high/low/close/volume） |
+| 配置项 | 环境变量 | 默认值 | 说明 |
+|--------|---------|--------|------|
+| DATA_DIR | DATACENTER_DATA_DIR | ~/.qclaw/datacenter | 数据存储目录 |
+| COMPRESSION | DATACENTER_COMPRESSION | SNAPPY | Parquet 压缩算法 |
+| ALLOW_DELETE | DATACENTER_ALLOW_DELETE | False | 是否允许删除数据 |
+| ALLOW_PUT | DATACENTER_ALLOW_PUT | False | 是否允许覆写数据 |
 
-**方法：**
+### SchemaManager
 
-| 方法 | 说明 |
-|------|------|
-| `get_dedup_key()` | 返回去重 key（当前为 "date"） |
-| `get_storage_pattern()` | 返回存储路径模板 |
-
-### DataRecord
-
-DOM 模式管理内存中的数据，支持紧凑格式 ↔ 完整格式双向转换。
+Schema 加载、验证、数据格式检查。
 
 ```python
-record = DataRecord(schema)
-record.set_metadata("code", "0700")
-record.set_metadata("exchange", "XHKG")
-record.add_record({"date": "2025-04-30", "data": [...]})
+from app.schema_manager import SchemaManager
+
+sm = SchemaManager("schemas/")
+
+# 加载 schema
+schema = sm.load_schema("stock_5min", "v1")
+
+# 获取存储规则
+storage_rule = sm.get_storage_rule("stock_5min", "v1")
+# 返回: "{schema.name}/{schema.Year}/{schema.Month}/{schema.date}.parquet"
+
+# 获取数据 schema
+data_schema = sm.get_data_schema("stock_5min", "v1")
+# 返回: {"Year": "string", "Month": "string", ...}
+
+# 验证数据
+valid, errors = sm.validate_data(df, "stock_5min", "v1")
+
+# 列出所有 schema
+schemas = sm.list_schemas()
 ```
 
-**方法：**
+**Schema 格式（REQ-003）**:
 
-| 方法 | 说明 |
-|------|------|
-| `set_metadata(key, value)` | 设置元数据字段 |
-| `add_record(record)` | 添加一条数据记录（按 date 去重） |
-| `to_compact()` | 导出为紧凑格式（只存 value 的嵌套数组） |
-| `to_full()` | 导出为完整格式（带 fieldName 的 dict） |
-| `from_compact(cls, schema, data)` | 从紧凑格式构造 DataRecord（类方法） |
+```json
+{
+  "name": "stock_5min",
+  "version": "v1",
+  "data_schema": {
+    "Year": "string",
+    "Month": "string",
+    "date": "string",
+    "time": "string",
+    "market": "string",
+    "stock_code": "string",
+    "stock_name": "string",
+    "open": "float",
+    "close": "float",
+    "high": "float",
+    "low": "float",
+    "volume": "int"
+  },
+  "storage_rule": "{schema.name}/{schema.Year}/{schema.Month}/{schema.date}.parquet"
+}
+```
 
-### DataManager
+**验证规则**:
+- 必填字段：name / version / data_schema / storage_rule
+- data_schema：dict、非空、key-value 均为 str
+- storage_rule：字符串、必须以 `.parquet` 结尾
+- `{schema.xxx}` 引用：name/version 内置免检，其他必须在 data_schema 有定义
 
-数据管理器，负责数据的写入、读取和 record.xml 维护。
+### StorageManager
+
+Parquet 文件读写，支持文件锁（进程安全）。
 
 ```python
-dm = DataManager(str(cfg.data_dir), "DataCenter/data_schema.xml")
-dm.write_data("XHKG", "0700", "腾讯控股", df, period="5min")
-df_loaded = dm.load_data("XHKG", "0700", "腾讯控股", 2025, 4)
+from app.storage_manager import StorageManager
+
+st = StorageManager(compression="SNAPPY")
+
+# 写入（支持 overwrite/append 模式）
+st.write_parquet([file_path], df, mode="overwrite")
+
+# 读取
+df = st.read_parquet([file_path1, file_path2])
+
+# 删除
+st.delete_parquet(file_path)
+
+# 文件存在检查
+exists = st.file_exists(file_path)
+
+# 元数据
+meta = st.get_file_metadata(file_path)
 ```
 
-**主要方法：**
+**支持压缩算法**: SNAPPY（默认）、GZIP、NONE
 
-| 方法 | 说明 |
-|------|------|
-| `write_data(exchange, code, name, df, period, preprocessor)` | 数据写入入口（带预处理器回调） |
-| `save_data(exchange, code, name, df, period)` | 实际写入逻辑（按月分组、自动合并已有数据） |
-| `load_data(exchange, code, name, year, month)` | 加载指定月份的 JSON，自动识别紧凑/完整格式 |
-| `export_to_full(exchange, code, name, year, month)` | 导出完整格式（含字段名） |
-| `list_available_data()` | 扫描 data 目录，返回所有可用数据文件信息 |
-| `get_stats()` | 返回统计摘要（文件数、总行数等） |
+**文件锁**: 使用 `fcntl.flock` 实现
+- `LOCK_EX` 写锁（排他）
+- `LOCK_SH` 读锁（共享）
+- 读写互斥，确保进程安全
+
+### IndexManager
+
+路径计算与分组，从 schema 的 storage_rule 自动推导。
+
+```python
+from app.index_manager import IndexManager
+
+im = IndexManager(schema_manager)
+
+# 写入路径（自动分组）
+path_map = im.get_write_paths(df, "stock_5min", "v1")
+# 返回: {"stock_5min/2026/05/2026-05-15.parquet": df_day1, 
+#        "stock_5min/2026/05/2026-05-16.parquet": df_day2}
+
+# 读取路径（支持 filter）
+paths = im.get_read_paths("stock_5min", "v1", date="2026-05-15")
+paths = im.get_read_paths("stock_5min", "v1", date=["2026-05-15", "2026-05-16"])
+paths = im.get_read_paths("stock_5min", "v1", date={"start": "2026-05-15", "end": "2026-05-17"})
+paths = im.get_read_paths("stock_5min", "v1", market="XHKG", stock_code="00700")
+```
+
+**Filter 支持类型**:
+- 单值：`date="2026-05-15"`
+- 枚举：`date=["2026-05-15", "2026-05-16"]`
+- 范围：`date={"start": "2026-05-15", "end": "2026-05-17"}`
+
+**路径渲染**:
+- 从 storage_rule 提取 `{schema.xxx}` 引用
+- 分离 path filters（用于 glob 扫描）和 row filters（DataFrame 过滤）
+
+### DataProcessor
+
+读写协调层，对外统一接口。
+
+```python
+from app.data_processor import DataProcessor
+
+dp = DataProcessor(schema_manager, index_manager, storage_manager)
+
+# 写入数据
+result = dp.write_data(df, "stock_5min", "v1")
+# 返回: {
+#   "success": True,
+#   "total_rows": 720,
+#   "files_written": 3,
+#   "file_paths": ["stock_5min/2026/05/2026-05-15.parquet", ...],
+#   "duplicates_found": 0,
+#   "duplicates_removed": 0
+# }
+
+# 读取数据
+df = dp.read_data("stock_5min", "v1", date="2026-05-15")
+df = dp.read_data("stock_5min", "v1", date={"start": "2026-05-15", "end": "2026-05-17"},
+                  market="XHKG", stock_code="00700")
+
+# 验证数据格式
+valid, errors = dp.validate_schema(df, "stock_5min", "v1")
+```
+
+**写入流程**:
+1. Schema 验证（列名、类型）
+2. 重复检测（基于 date/code/time 主键）
+3. 路径分组（按 storage_rule 字段拆分）
+4. 多文件写入（自动创建父目录）
+5. 返回写入结果
+
+**读取流程**:
+1. Filter 解析（path filters + row filters）
+2. Glob 扫描实际文件
+3. 合并读取多个 Parquet
+4. Row filter 过滤（DataFrame 级别）
 
 ## 数据流程
 
 ### 写入管线
 
 ```
-Collector.get_5min_range()
-    → DataManager.write_data()
-        → _write_data_with_validation() [检查周期/数据合法性]
-            → save_data() [核心写入]
-                1. 按 (year, month) 分组
-                2. 加载已有 JSON（若存在）
-                3. 按 date 去重合并
-                4. 写入 {data_dir}/{exchange}/{name}_{code}/{yearMM}.json
-                5. 更新 record.xml
+DataFrame 输入
+    → DataProcessor.write_data()
+        → validate_data() [Schema 验证]
+        → _find_duplicates() [重复检测]
+        → IndexManager.get_write_paths() [路径分组]
+        → StorageManager.write_parquet() [多文件写入]
 ```
 
 ### 读取管线
 
 ```
-DataManager.load_data(exchange, code, name, year, month)
-    → 自动检测 JSON 格式（紧凑 / 完整）
-    → 解析为 DataFrame 返回
+Filter 参数
+    → DataProcessor.read_data()
+        → IndexManager.get_read_paths() [Glob 扫描]
+        → StorageManager.read_parquet() [合并读取]
+        → Row filter 过滤 [DataFrame 级别]
 ```
 
-## 存储格式
+## 存储路径示例
 
-### 紧凑格式（默认）
+基于 `storage_rule: "{schema.name}/{schema.Year}/{schema.Month}/{schema.date}.parquet"`：
 
-JSON 数组，只存 value，按 `data_schema.xml` 定义的 index 顺序排列：
-
-```json
-[
-  "0700",        // [0] code
-  "XHKG",        // [1] exchange
-  "腾讯控股",     // [2] name
-  "5min",        // [3] period
-  2025,          // [4] year
-  4,             // [5] month
-  12345,         // [6] total_entry（总条数）
-  20,            // [7] total_date（总天数）
-  [             // [8] data
-    ["2025-04-30", [[093000, 350.0, 352.5, 349.8, 351.2, 12345678], ...]],
-    ["2025-04-29", [[093000, 348.0, ...], ...]]
-  ]
-]
+```
+{DATA_DIR}/
+├── stock_5min/
+│   └── 2026/
+│       └── 05/
+│           ├── 2026-05-15.parquet
+│           ├── 2026-05-16.parquet
+│           └── 2026-05-17.parquet
+├── stock_30min/
+│   └── 2026/
+│       └── 05/
+│           └── 2026-05-15.parquet
+├── stock_60min/
+│   └── 2026/
+│       └── 05/
+│           └── 2026-05-15.parquet
+└── stock_1day/
+    └── 2026/
+        └── 05/
+            └── 2026-05-15.parquet
 ```
 
-### 完整格式
+## 使用示例
 
-带字段名的嵌套 dict，由 `to_full()` / `export_to_full()` 导出：
-
-```json
-{
-  "code": "0700",
-  "exchange": "XHKG",
-  "name": "腾讯控股",
-  "period": "5min",
-  "year": 2025,
-  "month": 4,
-  "total_entry": 12345,
-  "total_date": 20,
-  "data": [
-    {
-      "date": "2025-04-30",
-      "data": [
-        {"time": "09:30", "open": 350.0, "high": 352.5, "low": 349.8, "close": 351.2, "volume": 12345678},
-        ...
-      ]
-    },
-    ...
-  ]
-}
-```
-
-## record.xml
-
-`data/record.xml` 记录所有已写入的数据文件元数据：
-
-```xml
-<?xml version="1.0" encoding="utf-8"?>
-<record version="1.0" createdAt="2025-05-03 18:23:00">
-  <files>
-    <file path="XHKG/腾讯控股_0700/202504.json"
-          exchange="XHKG" code="0700" year="2025" month="4"
-          createdAt="2025-05-03 18:23:00"/>
-  </files>
-</record>
-```
-
-## 外部调用示例
+### 完整流程
 
 ```python
-from DataCenter.data_manager import DataManager
-from config import Config
+import os
+import pandas as pd
+from app.config import Config
+from app.schema_manager import SchemaManager
+from app.storage_manager import StorageManager
+from app.index_manager import IndexManager
+from app.data_processor import DataProcessor
 
-cfg = Config("config.xml")
-dm = DataManager(str(cfg.data_dir), "DataCenter/data_schema.xml")
+# 初始化
+os.environ["DATACENTER_DATA_DIR"] = "/path/to/data"
+config = Config()
+
+sm = SchemaManager("schemas/")
+st = StorageManager(compression=config.COMPRESSION)
+im = IndexManager(sm)
+dp = DataProcessor(sm, im, st)
+
+# 生成数据
+df = pd.DataFrame([
+    {"Year": "2026", "Month": "05", "date": "2026-05-15", "time": "09:00",
+     "market": "XHKG", "stock_code": "00700", "stock_name": "腾讯控股",
+     "open": 350.0, "close": 351.5, "high": 352.0, "low": 349.0, "volume": 12345},
+    ...
+])
 
 # 写入
-dm.write_data("XHKG", "0700", "腾讯控股", df, period="5min")
+result = dp.write_data(df, "stock_5min", "v1")
+print(f"写入成功: {result['total_rows']} 行, {result['files_written']} 文件")
 
 # 读取
-df = dm.load_data("XHKG", "0700", "腾讯控股", 2025, 4)
+df_read = dp.read_data("stock_5min", "v1", date="2026-05-15")
+print(f"读取: {len(df_read)} 行")
 
-# 导出完整格式
-full_data = dm.export_to_full("XHKG", "0700", "腾讯控股", 2025, 4)
-
-# 查看统计
-stats = dm.get_stats()
-print(stats)
+# Filter 读取
+df_hk = dp.read_data("stock_5min", "v1", 
+                     date={"start": "2026-05-15", "end": "2026-05-17"},
+                     market=["XHKG", "XSHG"],
+                     stock_code="00700")
 ```
+
+### 跨文件写入
+
+一次写入多日数据，自动拆分到多个文件：
+
+```python
+# 3 天数据合并为一个 DataFrame
+df_3days = pd.DataFrame([...])  # 包含 2026-05-15/16/17 的数据
+
+result = dp.write_data(df_3days, "stock_5min", "v1")
+# 自动生成 3 个文件：
+# - stock_5min/2026/05/2026-05-15.parquet
+# - stock_5min/2026/05/2026-05-16.parquet
+# - stock_5min/2026/05/2026-05-17.parquet
+```
+
+## 测试
+
+### 单元测试
+
+```bash
+pytest tests/ -v
+# 144 passed, 100%
+```
+
+**测试覆盖**:
+- Config: 33 测试（配置优先级、XML 加载、单例）
+- SchemaManager: 54 测试（加载、验证、引用检查）
+- StorageManager: 35 测试（写入、读取、压缩、文件锁）
+- IndexManager: 14 测试（路径分组、filter）
+- DataProcessor: 13 测试（写入、读取、验证）
+
+### 集成测试
+
+```bash
+cd CTtest
+python test_write.py    # 多级别/多天/多市场写入验证
+python test_filters.py  # Filter 功能测试
+```
+
+详细测试报告见 `test-report.md`。
+
+## 设计文档
+
+- `requirement.md` - 需求文档（REQ-001~REQ-004）
+- `design-plan.md` - 设计文档（架构、接口、Schema 格式）
 
 ## 注意事项
 
-- `save_data()` 按 date 去重，重复日期的数据不会覆盖已有记录
-- `load_data()` 自动检测文件格式（紧凑 dict 或完整 list），无需手动判断
-- 存储路径中的 `{name}` 部分直接使用传入的 name 参数，建议使用纯英文或下划线避免路径问题
-- record.xml 由 DataManager 自动维护，外部不应手动修改
+1. **Schema 不可动态扩展**：新增 data_type 需版本升级，SchemaManager 加载后不可变
+2. **文件锁是建议锁**：fcntl.flock 是 advisory lock，非强制，需所有进程配合
+3. **重复检测**：基于 schema 主键（date/code/time）自动检测并移除重复行
+4. **Filter 分离**：path filters（glob 扫描）+ row filters（DataFrame 过滤）
+5. **跨平台兼容**：DATA_DIR 支持环境变量/XML 配置，适配不同部署环境
+
+## 新增数据类型开发路径
+
+详见完整文档 `data-types.md`，以下为快速步骤：
+
+### 步骤 1：定义 Schema
+
+在 `schemas/` 目录下创建 `{data_type}_v1.json`：
+
+```json
+{
+  "name": "stock_1min",
+  "version": "v1",
+  "data_schema": {
+    "Year": "string",
+    "Month": "string",
+    "date": "string",
+    "time": "string",
+    "market": "string",
+    "stock_code": "string",
+    "stock_name": "string",
+    "open": "float",
+    "close": "float",
+    "high": "float",
+    "low": "float",
+    "volume": "int"
+  },
+  "storage_rule": "{schema.name}/{schema.Year}/{schema.Month}/{schema.date}.parquet"
+}
+```
+
+### 步骤 2：理解 Filter 设计
+
+`storage_rule` 中出现的 `{schema.xxx}` 字段自动成为 **Path Filter**（用于 glob 扫描，减少 I/O）。`data_schema` 中未出现在路径里的字段自动成为 **Row Filter**（读取后在内存过滤）。
+
+| storage_rule 包含 | Filter 类型 | 说明 |
+|-----------------|------------|------|
+| `{schema.date}` | Path Filter | date 在路径中，可 glob 扫描 |
+| `{schema.Year}` / `{schema.Month}` | Path Filter（内置） | 自动从 date 解析 |
+| `{schema.market}` / `{schema.stock_code}` | Row Filter | 不在路径中，读取后过滤 |
+
+**示例对比**：
+
+| 数据类型 | storage_rule | Path Filter | Row Filter |
+|---------|-------------|------------|------------|
+| stock_5min | `{name}/{Year}/{Month}/{date}.parquet` | date / Year / Month | market / stock_code |
+| stock_30min | `{name}/{Year}/{Month}.parquet` | Year / Month | date / market / stock_code |
+
+### 步骤 3：编写单元测试
+
+```python
+# tests/test_data_processor.py 中添加 fixture
+{
+    "name": "new_type",
+    "version": "v1",
+    "data_schema": {"Year": "string", "Month": "string", "date": "string",
+                      "time": "string", "market": "string", "stock_code": "string",
+                      "stock_name": "string", "open": "float", "close": "float",
+                      "high": "float", "low": "float", "volume": "int"},
+    "storage_rule": "{schema.name}/{schema.Year}/{schema.Month}/{schema.date}.parquet"
+}
+```
+
+### 步骤 4：运行测试
+
+```bash
+pytest tests/ -v
+```
+
+### 步骤 5：编写集成测试（Filter 验证）
+
+```bash
+# CTtest/test_filters.py 中添加新数据类型测试
+# 必需场景：
+#   - date/Year/Month: 单值 + 枚举 + 范围
+#   - market/stock_code: 单值 + 枚举
+#   - 组合 Filter
+#   - 无 Filter 全量读取
+```
+
+### 步骤 6：运行集成测试
+
+```bash
+cd CTtest
+python test_write.py
+python test_filters.py
+```
+
+### 步骤 7：更新文档
+
+- `data-types.md` — 新增数据类型章节（schema / storage_rule / filter 支持 / 实测结果）
+- `README.md` — schemas/ 目录下更新文件列表（如有新增）
+
+### 检查清单
+
+- [ ] Schema 文件放置到 `schemas/` 目录
+- [ ] `_validate_schema` 验证通过（非法 schema 拒绝加载）
+- [ ] 单元测试覆盖新类型（`get_write_paths` / `get_read_paths`）
+- [ ] Path Filter 三种类型（单值/枚举/范围）测试通过
+- [ ] Row Filter 三种类型（单值/枚举/范围）测试通过
+- [ ] 组合 Filter 测试通过
+- [ ] 数据完整性验证（写入-读取一致性）
+- [ ] `data-types.md` 更新
+
+详细说明和完整测试模板见 `data-types.md` 第八节。
+
+## 后续开发
+
+- [ ] API Handler（Flask Blueprint）
+- [ ] RESTful API 文档
+- [ ] Docker 部署配置
+- [ ] 监控与告警

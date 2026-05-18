@@ -248,30 +248,44 @@ class IndexManager:
         version: str,
         filter_: Dict[str, Any],
     ) -> Optional[str]:
-        """渲染为 glob 模式（未提供的字段用 *）"""
+        """渲染为 glob 模式（未提供的字段用 *）
+
+        动态处理所有 {schema.xxx} placeholder，不硬编码字段名。
+        """
         result = storage_rule
         result = result.replace("{schema.name}", data_type)
         result = result.replace("{schema.version}", version)
 
-        # date 处理
-        if "date" in filter_ and filter_["date"]:
-            date_str = str(filter_["date"])
-            result = result.replace("{schema.date}", date_str)
-            if len(date_str) >= 10:
-                result = result.replace("{schema.year}", date_str[:4])
-                result = result.replace("{schema.month}", date_str[5:7])
-        else:
-            # date 未指定，用通配符
-            result = result.replace("{schema.date}", "*")
-            result = result.replace("{schema.year}", "*")
-            result = result.replace("{schema.month}", "*")
+        # 提取所有 {schema.xxx} placeholder
+        import re
+        placeholders = re.findall(r'\{schema\.([\w]+)\}', result)
 
-        # 其他字段
-        for key in ["market", "code", "size"]:
-            placeholder = "{schema." + key + "}"
-            if placeholder in result:
-                if key in filter_ and filter_[key]:
-                    result = result.replace(placeholder, str(filter_[key]))
+        for field_name in placeholders:
+            placeholder = "{schema." + field_name + "}"
+
+            # 特殊处理：date 字段用于提取 Year/Month
+            if field_name.lower() == "date":
+                if "date" in filter_ and filter_["date"]:
+                    date_str = str(filter_["date"])
+                    result = result.replace(placeholder, date_str)
+                else:
+                    result = result.replace(placeholder, "*")
+            elif field_name.lower() == "year":
+                # Year 从 date 提取
+                if "date" in filter_ and filter_["date"] and len(str(filter_["date"])) >= 4:
+                    result = result.replace(placeholder, str(filter_["date"])[:4])
+                else:
+                    result = result.replace(placeholder, "*")
+            elif field_name.lower() == "month":
+                # Month 从 date 提取
+                if "date" in filter_ and filter_["date"] and len(str(filter_["date"])) >= 7:
+                    result = result.replace(placeholder, str(filter_["date"])[:7][5:7])
+                else:
+                    result = result.replace(placeholder, "*")
+            else:
+                # 其他字段：从 filter_ 获取值，否则用 *
+                if field_name in filter_ and filter_[field_name]:
+                    result = result.replace(placeholder, str(filter_[field_name]))
                 else:
                     result = result.replace(placeholder, "*")
 
