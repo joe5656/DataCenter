@@ -1,5 +1,5 @@
 {
-    "name": "stock_5min",
+    "name": "stock_60min",
     "version": "v1",
     "data_schema": {
         "Year": "string",
@@ -15,5 +15,5 @@
         "low": "double",
         "volume": "int64"
     },
-    "storage_rule": "{schema.name}/{schema.Year}/{schema.Month}/{schema.date}.parquet"
+    "storage_rule": "{schema.name}/{schema.Year}/{schema.Month}.parquet"
 }
