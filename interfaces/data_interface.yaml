@@ -1,0 +1,126 @@
+# DataCenter RESTful API Interface Definition
+# 供 restfulapi-interface DynamicLoader 加载
+
+name: datacenter
+version: 1.0.0
+description: 金融数据存储中心 RESTful API
+
+# ================================================================
+# 路由：每个 HTTP 方法 → DataHandler 对应方法
+# data_type 由 DataHandler._extract_data_type() 从 request.path 解析
+# ================================================================
+routes:
+  # ----------------------------------------------------------------
+  # 数据路由：GET / POST / PUT / DELETE  /api/v1/<data_type>
+  # ----------------------------------------------------------------
+  - path: /api/v1/stock_5min
+    methods: [GET]
+    handler: handler_factory:DataHandler
+    description: "查询 stock_5min 数据"
+
+  - path: /api/v1/stock_5min
+    methods: [POST]
+    handler: handler_factory:DataHandler
+    description: "写入 stock_5min 数据（自动去重）"
+
+  - path: /api/v1/stock_5min
+    methods: [PUT]
+    handler: handler_factory:DataHandler
+    description: "全量覆盖 stock_5min（受 ALLOW_PUT 控制）"
+
+  - path: /api/v1/stock_5min
+    methods: [DELETE]
+    handler: handler_factory:DataHandler
+    description: "删除 stock_5min 数据（受 ALLOW_DELETE 控制）"
+
+  - path: /api/v1/stock_5min/schemas
+    methods: [GET]
+    handler: handler_factory:DataHandler
+    description: "查询 stock_5min Schema 版本"
+
+  - path: /api/v1/stock_5min/stats
+    methods: [GET]
+    handler: handler_factory:DataHandler
+    description: "查询 stock_5min 存储统计"
+
+  # ----------------------------------------------------------------
+  # stock_30min
+  # ----------------------------------------------------------------
+  - path: /api/v1/stock_30min
+    methods: [GET]
+    handler: handler_factory:DataHandler
+    description: "查询 stock_30min 数据"
+
+  - path: /api/v1/stock_30min
+    methods: [POST]
+    handler: handler_factory:DataHandler
+
+  - path: /api/v1/stock_30min
+    methods: [PUT]
+    handler: handler_factory:DataHandler
+
+  - path: /api/v1/stock_30min
+    methods: [DELETE]
+    handler: handler_factory:DataHandler
+
+  - path: /api/v1/stock_30min/schemas
+    methods: [GET]
+    handler: handler_factory:DataHandler
+
+  - path: /api/v1/stock_30min/stats
+    methods: [GET]
+    handler: handler_factory:DataHandler
+
+  # ----------------------------------------------------------------
+  # stock_60min
+  # ----------------------------------------------------------------
+  - path: /api/v1/stock_60min
+    methods: [GET]
+    handler: handler_factory:DataHandler
+
+  - path: /api/v1/stock_60min
+    methods: [POST]
+    handler: handler_factory:DataHandler
+
+  - path: /api/v1/stock_60min
+    methods: [PUT]
+    handler: handler_factory:DataHandler
+
+  - path: /api/v1/stock_60min
+    methods: [DELETE]
+    handler: handler_factory:DataHandler
+
+  - path: /api/v1/stock_60min/schemas
+    methods: [GET]
+    handler: handler_factory:DataHandler
+
+  - path: /api/v1/stock_60min/stats
+    methods: [GET]
+    handler: handler_factory:DataHandler
+
+  # ----------------------------------------------------------------
+  # stock_1day
+  # ----------------------------------------------------------------
+  - path: /api/v1/stock_1day
+    methods: [GET]
+    handler: handler_factory:DataHandler
+
+  - path: /api/v1/stock_1day
+    methods: [POST]
+    handler: handler_factory:DataHandler
+
+  - path: /api/v1/stock_1day
+    methods: [PUT]
+    handler: handler_factory:DataHandler
+
+  - path: /api/v1/stock_1day
+    methods: [DELETE]
+    handler: handler_factory:DataHandler
+
+  - path: /api/v1/stock_1day/schemas
+    methods: [GET]
+    handler: handler_factory:DataHandler
+
+  - path: /api/v1/stock_1day/stats
+    methods: [GET]
+    handler: handler_factory:DataHandler

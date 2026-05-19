@@ -1,0 +1,7 @@
+# DataCenter Python 依赖
+# restfulapi-interface 层已有：Flask / uwsgi / PyYAML / gunicorn / python-dotenv
+# 此文件仅列出 DataCenter 额外需要的包
+
+pyarrow==24.0.0
+pandas==3.0.2
+lxml==6.1.0

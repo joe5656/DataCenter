@@ -2045,22 +2045,280 @@ Client → GET /api/v1/data/{data_type} → Handler
 
 ---
 
-## 10. 附录
+## 10. Filter 机制设计
 
-### 10.1 参考资料
+### 10.1 现状问题
+
+当前数据过滤逻辑分散在三处，职责不清、效率低下：
+
+| 位置 | 当前职责 | 问题 |
+|------|---------|------|
+| `handler_factory.get()` | 硬编码 filter 字段列表 `['date', 'market', 'stock_code', 'year', 'month']` | 新增数据类型需改代码；不合法 filter 未拦截 |
+| `index_manager.get_read_paths()` | 根据 filter 计算 glob 路径模式，只处理**路径级字段** | 分类结果未回传，DataProcessor 不知道哪些已被路径级处理过 |
+| `data_processor.read_data()` | 读取后对 DataFrame 做**行级过滤** | 对所有 filters 逐字段过滤，路径级字段被重复过滤 |
+
+**核心问题**：
+1. **无合法性检查** — handler 不验证 filter 字段是否在 schema 中，非法字段静默忽略或报错
+2. **硬编码字段名** — 新增数据类型必须改 handler 代码
+3. **路径/行级分类结果未传递** — IndexManager 知道哪些是路径级、哪些是行级，但分类结果没回传给 DataProcessor
+4. **重复过滤** — date 等路径级字段被 IndexManager 和 DataProcessor 各过滤一次
+5. **不支持操作符** — 只能 `field=value`，不支持 `field>value`、`field!=value` 等
+
+### 10.2 设计目标
+
+1. **Handler 做合法性检查** — 只放行 schema 中定义的字段，不合法的过滤掉并记录警告
+2. **IndexManager 做路径/行级分类** — 自己分离后，路径级用来算路径，行级回传给 DataProcessor
+3. **DataProcessor 只用行级 filter** — 拿 IndexManager 回传的行级 filter 做过滤，不再重复
+4. **零硬编码** — filter 字段从 schema 推导，新增数据类型无需改代码
+5. **支持扩展操作符** — `=, !=, >, <, >=, <=, in, between, like`
+6. **向前兼容** — 现有 `?date=xxx&stock_code=xxx` 简单语法继续可用
+
+### 10.3 职责划分
+
+```
+Handler                        IndexManager                   DataProcessor
+  │                                │                              │
+  │ query params                   │                              │
+  │ ──→ 合法性检查                  │                              │
+  │     (字段在 schema fields 中？) │                              │
+  │                                │                              │
+  │ 合法的 filters                  │                              │
+  │ ─────────────────────────────→ │                              │
+  │                                │ 分类：                        │
+  │                                │  路径级 → 算 glob 路径        │
+  │                                │  行级   → 收集回传            │
+  │                                │                              │
+  │                  paths + row_filters                          │
+  │ ───────────────────────────────────────────────────────────→ │
+  │                                │                      用 row_filters 过滤
+  │                                │                      DataFrame
+```
+
+### 10.4 各组件详细设计
+
+#### 10.4.1 Handler — 合法性检查
+
+**职责**：只做一件事 — 检查 filter 字段是否合法，不合法的过滤掉。
+
+**合法性规则**：
+- 字段名必须在 schema 的 `fields` 中定义（包括 `field__operator` 中的 field 部分）
+- 不合法的字段：丢弃 + 记录 warning 日志
+- 不做路径/行级分类（那是 IndexManager 的事）
+
+```python
+# Before（硬编码白名单）
+filters = {k: request.args[k] for k in ['date', 'market', 'stock_code', 'year', 'month']
+           if k in request.args}
+
+# After（从 schema 推导）
+raw_params = request.args.to_dict()
+schema = self.sm.load_schema(data_type, version)
+valid_fields = {f['name'] for f in schema['fields']}
+
+filters = {}
+for key, value in raw_params.items():
+    field_name = key.split('__')[0]  # field__operator → field
+    if field_name in valid_fields:
+        filters[key] = value
+    else:
+        logger.warning(f"Ignoring unknown filter field: {field_name}")
+
+df = self.dp.read_data(data_type, version, **filters)
+```
+
+#### 10.4.2 IndexManager — 分类 + 回传行级 filter
+
+**职责变更**：`get_read_paths()` 返回值从 `List[str]` 变为 `Tuple[List[str], Dict]`，第二个元素是行级 filter。
+
+**分类逻辑**：
+- 字段出现在 `storage_rule` 的 `{schema.xxx}` 中 → **路径级**，用于计算 glob 路径
+- 字段不在 `storage_rule` 中 → **行级**，原样收集回传
+
+```python
+# Before
+def get_read_paths(self, data_type, version='v1', **filters) -> List[str]:
+    # 只用路径级 filter 算路径
+    # 行级 filter 静默忽略
+    ...
+    return existing_paths
+
+# After
+def get_read_paths(self, data_type, version='v1', **filters) -> Tuple[List[str], Dict]:
+    storage_rule = self.schema_manager.get_storage_rule(data_type, version)
+    rule_fields = set(self._extract_path_refs(storage_rule))
+
+    # 分类
+    path_filters = {k: v for k, v in filters.items() if k in rule_fields}
+    row_filters = {k: v for k, v in filters.items() if k not in rule_fields}
+
+    # 路径级 → 算 glob（现有逻辑不变）
+    candidate_patterns = self._generate_candidate_patterns(storage_rule, data_type, version, path_filters)
+    existing_paths = [...]  # 现有扫描逻辑
+
+    return existing_paths, row_filters
+```
+
+**扩展语法支持**（操作符分类）：
+
+对于 `field__operator` 格式的 filter：
+- 取 `field` 部分判断路径级/行级
+- 操作符（gt/lt/ne/like 等）只影响行级过滤执行方式
+- `between` 对路径级字段：转为 `{start, end}` 格式（IndexManager 已支持）
+- `ne`/`like` 对路径级字段：**降级为行级**（路径无法取反/模糊）
+
+```python
+# 操作符降级处理
+for key, value in filters.items():
+    parts = key.split('__')
+    field = parts[0]
+    operator = parts[1] if len(parts) > 1 else 'eq'
+
+    if field in rule_fields:
+        # 路径级字段，但某些操作符不支持
+        if operator in ('ne', 'like'):
+            # 降级为行级
+            row_filters[key] = value
+        else:
+            path_filters[key] = value
+    else:
+        row_filters[key] = value
+```
+
+#### 10.4.3 DataProcessor — 只用行级 filter
+
+**职责变更**：不再自己做分类，直接用 IndexManager 回传的行级 filter。
+
+```python
+# Before
+def read_data(self, data_type, version='v1', **filters) -> pd.DataFrame:
+    relative_paths = self.index_manager.get_read_paths(data_type, version, **filters)
+    ...
+    # 对所有 filters 逐字段过滤（路径级+行级重复）
+    for key, value in filters.items():
+        ...
+
+# After
+def read_data(self, data_type, version='v1', **filters) -> pd.DataFrame:
+    paths, row_filters = self.index_manager.get_read_paths(data_type, version, **filters)
+
+    # 读取数据
+    dfs = []
+    for rel_path in paths:
+        abs_path = self.index_manager.to_absolute_path(rel_path)
+        if self.storage_manager.file_exists(abs_path):
+            dfs.append(self.storage_manager.read_parquet([abs_path]))
+
+    if not dfs:
+        return pd.DataFrame()
+
+    result = pd.concat(dfs, ignore_index=True)
+
+    # 只用行级 filter 过滤
+    for key, value in row_filters.items():
+        field = key.split('__')[0]
+        operator = key.split('__')[1] if '__' in key else 'eq'
+        result = self._apply_filter(result, field, operator, value)
+
+    return result
+```
+
+#### 10.4.4 操作符执行逻辑
+
+DataProcessor 内部的 `_apply_filter()` 方法：
+
+| 操作符 | DataFrame 过滤 | 示例 |
+|--------|---------------|------|
+| `eq` | `df[col] == val` | `?stock_code=00700` |
+| `ne` | `df[col] != val` | `?market__ne=XSHG` |
+| `gt` | `df[col] > val` | `?close__gt=400` |
+| `gte` | `df[col] >= val` | `?volume__gte=1000000` |
+| `lt` | `df[col] < val` | `?close__lt=500` |
+| `lte` | `df[col] <= val` | `?volume__lte=5000000` |
+| `in` | `df[col].isin(vals)` | `?stock_code__in=00700,09988` |
+| `between` | `(df[col] >= a) & (df[col] <= b)` | `?close__between=400,500` |
+| `like` | `df[col].str.contains(pat)` | `?stock_name__like=腾讯` |
+
+**简单语法兼容**：`?field=val1,val2` 中逗号分隔 → 自动识别为 `in` 操作符。
+
+### 10.5 数据流
+
+#### 10.5.1 读取请求完整流程
+
+```
+HTTP Request: GET /api/v1/stock_5min?date=2026-05-19&stock_code=00700&foo=bar
+    │
+    ▼
+handler_factory.get()
+    │
+    ├─ 1. raw_params = request.args.to_dict()
+    │      {date: 2026-05-19, stock_code: 00700, foo: bar}
+    │
+    ├─ 2. 合法性检查（对照 schema fields）
+    │      date ✓  stock_code ✓  foo ✗ → 丢弃 + warning
+    │      filters = {date: 2026-05-19, stock_code: 00700}
+    │
+    ├─ 3. data_processor.read_data(data_type, version, **filters)
+    │     │
+    │     ├─ 3a. paths, row_filters = index_manager.get_read_paths(
+    │     │        data_type, version, date=2026-05-19, stock_code=00700)
+    │     │     │
+    │     │     │  IndexManager 内部：
+    │     │     │    date 在 storage_rule → 路径级 → 算 glob
+    │     │     │    stock_code 不在 → 行级 → 收集回传
+    │     │     │
+    │     │     │  返回: paths=[...05-19.parquet], row_filters={stock_code: 00700}
+    │     │     │
+    │     ├─ 3b. 读取 paths 中的文件 → concat
+    │     │
+    │     └─ 3c. 用 row_filters 过滤 DataFrame
+    │            stock_code == 00700 → 精确结果
+    │
+    └─ 4. 返回 JSON
+```
+
+**关键**：路径级字段（date）在 IndexManager 中消费掉，不回传给 DataProcessor，避免重复过滤。
+
+### 10.6 接口变更总结
+
+| 组件 | 变更 |
+|------|------|
+| `handler_factory.get()` | 硬编码字段列表 → 从 schema fields 推导 + 合法性检查 |
+| `index_manager.get_read_paths()` | 返回值 `List[str]` → `Tuple[List[str], Dict]`，新增行级 filter 回传 |
+| `data_processor.read_data()` | 不再自行分类过滤，直接用 IndexManager 回传的行级 filter |
+| 新增文件 | 无 — 不引入新模块，职责分摊到现有三个组件 |
+
+### 10.7 测试用例
+
+| # | 请求 | Handler 检查 | IndexManager 分类 | DataProcessor 过滤 | 预期 |
+|---|------|-------------|-------------------|-------------------|------|
+| 1 | `?date=2026-05-19` | ✓ | 路径级:date | 无行级 | 只扫描 05-19 文件 |
+| 2 | `?stock_code=00700` | ✓ | 行级:stock_code | stock_code==00700 | 扫描全部文件，读后过滤 |
+| 3 | `?date=2026-05-19&stock_code=00700` | ✓ | 路径级:date, 行级:stock_code | stock_code==00700 | 扫描 05-19，读后过滤 |
+| 4 | `?date__between=2026-05-01,2026-05-19` | ✓ | 路径级:date(between) | 无行级 | 扫描 05-01~05-19 |
+| 5 | `?close__gt=400` | ✓ | 行级:close(gt) | close>400 | 全扫描，读后过滤 |
+| 6 | `?market__ne=XSHG` | ✓ | 行级:market(ne) | market!=XSHG | 全扫描，读后过滤 |
+| 7 | `?stock_code__in=00700,09988` | ✓ | 行级:stock_code(in) | isin([00700,09988]) | 读后过滤 |
+| 8 | `?foo=bar` | ✗ 丢弃 | — | — | 忽略非法字段 |
+| 9 | `?date=2026-05-19&close__gte=400` | ✓ | 路径级:date, 行级:close(gte) | close>=400 | 扫描 05-19，读后过滤 |
+
+---
+
+## 11. 附录
+
+### 11.1 参考资料
 
 - [Apache Parquet 官方文档](https://parquet.apache.org/docs/)
 - [PyArrow 文档](https://arrow.apache.org/docs/python/)
 - [OpenAPI 规范](https://swagger.io/specification/)
 - [RESTful API 设计最佳实践](https://restfulapi.net/)
 
-### 10.2 相关项目
+### 11.2 相关项目
 
 - **baseos**: 基础操作系统镜像
 - **restfulapi-interface**: RESTful API 基础镜像
 - **stockdata**: 股票数据采集项目（未来集成）
 
-### 10.3 变更日志
+### 11.3 变更日志
 
 | 版本 | 日期 | 作者 | 变更内容 |
 |------|------|------|----------|
@@ -2069,6 +2327,7 @@ Client → GET /api/v1/data/{data_type} → Handler
 | v1.2 | 2026-05-17 | AI | 三项更新：数据类型不支持动态扩展(版本升级实现)；API新增ALLOW_PUT/ALLOW_DELETE配置开关；API路径体现data_type |
 | v1.3 | 2026-05-17 | AI | 新增 REQ-005 配置管理章节（§6）；更新全文章节编号 |
 | v1.4 | 2026-05-17 | AI | 统一命名：`ALLOW_MODIFY` → `ALLOW_PUT`（全文替换） |
+| v1.5 | 2026-05-19 | AI | 新增 §10 Filter 机制设计：Handler 合法性检查 + IndexManager 分类回传 + DataProcessor 只用行级 filter |
 
 ---
 

@@ -1,6 +1,6 @@
 # DataCenter 项目测试报告
 
-**测试日期**: 2026-05-18  
+**测试日期**: 2026-05-18（更新 API 测试 13:05）  
 **测试环境**: macOS 12.7.6, Python 3.13.12, pytest 9.0.3  
 **项目路径**: ~/JoeClawWorkspace/DataCenter
 
@@ -149,7 +149,102 @@ string / int / integer / float / double / bool / boolean / date / datetime / tim
 
 ---
 
-## 二、集成测试（CT）
+## 二、RESTful API 集成测试（13:05 新增）
+
+### 2.1 测试概览
+
+| 测试类 | 测试用例数 | 通过率 |
+|--------|-----------|--------|
+| TestRootAndHealth | 2 | 100% |
+| TestSchemaEndpoint | 3 | 100% |
+| TestStatsEndpoint | 2 | 100% |
+| TestGetEndpoint | 6 | 100% |
+| TestPostEndpoint | 4 | 100% |
+| TestPutEndpoint | 1 | 100% |
+| TestDeleteEndpoint | 2 | 100% |
+| **总计** | **20** | **100%** |
+
+### 2.2 路由结构
+
+每个 schema（stock_5min / stock_30min / stock_60min / stock_1day）独立注册一组路径，共 24 条 schema 路由，加上 2 条全局路由：
+
+```
+GET  /api/v1/<schema>             → 查询数据
+POST /api/v1/<schema>             → 写入数据（自动去重）
+PUT  /api/v1/<schema>             → 全量覆盖（ALLOW_PUT 默认关闭）
+DELETE /api/v1/<schema>           → 删除数据（ALLOW_DELETE 默认关闭）
+GET  /api/v1/<schema>/schemas     → 查询 schema 版本
+GET  /api/v1/<schema>/stats       → 存储统计
+GET  /                            → API 根路径
+GET  /health                      → 健康检查
+```
+
+**路由注册机制**：Handler 工厂（`app/handlers/handler_factory.py`）读取 `schemas/` 目录，动态为每个 schema 注册路由，无需手动维护。
+
+### 2.3 测试用例详情
+
+| 测试类 | 测试用例 | 验证内容 |
+|--------|---------|---------|
+| TestRootAndHealth | `test_root` | GET / → status=200, version="1.0.0" |
+| TestRootAndHealth | `test_health` | GET /health → status=200 |
+| TestSchemaEndpoint | `test_get_schemas_success` | GET /api/v1/stock_5min/schemas → 200 |
+| TestSchemaEndpoint | `test_get_schemas_not_found` | GET /api/v1/nonexistent/schemas → JSON 404 |
+| TestSchemaEndpoint | `test_get_schemas_all_types` | 遍历 4 个 schema 均返回 200 |
+| TestStatsEndpoint | `test_get_stats_success` | GET .../stats → total_files/total_rows/size_mb |
+| TestStatsEndpoint | `test_get_stats_all_types` | 遍历 4 个 schema 均返回 data_type 匹配 |
+| TestGetEndpoint | `test_get_no_filter` | GET ... → 200, data + metadata |
+| TestGetEndpoint | `test_get_filter_by_date_single` | date=2026-05-15 → 仅该日数据 |
+| TestGetEndpoint | `test_get_filter_by_market` | market=XHKG → 仅港股数据 |
+| TestGetEndpoint | `test_get_filter_by_stock_code` | stock_code=00700 → 仅腾讯 |
+| TestGetEndpoint | `test_get_filter_combined` | date+market+code 组合过滤 |
+| TestGetEndpoint | `test_get_schema_not_found` | GET nonexistent → JSON 404 |
+| TestPostEndpoint | `test_post_success` | POST → 201, file_paths, rows_written |
+| TestPostEndpoint | `test_post_empty_data` | data=[] → 400 |
+| TestPostEndpoint | `test_post_empty_body` | 空 body → 400 |
+| TestPostEndpoint | `test_post_schema_not_found` | POST nonexistent → 404 |
+| TestPutEndpoint | `test_put_disabled_returns_405` | PUT → 405, "disabled by configuration" |
+| TestDeleteEndpoint | `test_delete_disabled_returns_405` | DELETE → 405 |
+| TestDeleteEndpoint | `test_delete_requires_filter` | DELETE 无参数 → 405 |
+
+### 2.4 API 统一响应格式
+
+```json
+// GET /api/v1/<schema>
+{"success": true, "data": [...], "metadata": {"data_type": "...", "total_rows": N, "filters": {...}}}
+
+// POST /api/v1/<schema>
+{"success": true, "message": "Data written successfully", "details": {"total_rows": N, "files_written": N, "file_paths": [...], "duplicates_found": N}}
+
+// 未注册路径 → 404
+{"success": false, "error": "Not found"}
+
+// PUT/DELETE 默认关闭
+{"success": false, "error": "...operation is disabled by configuration"}
+```
+
+### 2.5 Bug 修复历史
+
+| Bug | 发现时间 | 问题描述 | 修复 |
+|-----|---------|---------|------|
+| 路由注册 endpoint 冲突 | 13:00 | 多个 schema 共用 `get_data` 函数名，Flask AssertionError | 用 `_make_endpoint(prefix, data_type)` 生成唯一名称 |
+| conftest 路径错误 | 13:00 | `DATACENTER_SCHEMAS_DIR` 指向 `tests/schemas` 而非 `schemas`，导致 404 | 修正 os.path.dirname 层数 |
+| nonexistent 返回 HTML 404 | 13:02 | 未注册 schema 返回 HTML 而非 JSON | 添加 `@app.errorhandler(404)` 全局 JSON 响应 |
+
+### 2.6 运行方式
+
+```bash
+# API 测试（显式路径方案）
+pytest tests/api/test_api.py -v
+
+# 手动验证（启动 Flask 服务）
+cd ~/JoeClawWorkspace/DataCenter
+DATACENTER_DATA_DIR=./CTtest/data DATACENTER_SCHEMAS_DIR=./schemas python run_api.py
+# 访问 http://localhost:5000
+```
+
+---
+
+## 三、集成测试（CT）
 
 ### 2.1 测试脚本
 
@@ -240,19 +335,22 @@ data/stock_30min/2026/05/2026-05-15.parquet (99行)
 
 ---
 
-## 三、测试覆盖总结
+## 四、测试覆盖总结
 
-### 3.1 功能覆盖
+### 4.1 功能覆盖
 
-| 模块 | 核心功能 | UT 覆盖 | CT 覆盖 |
+| 模块 | 核心功能 | UT 覆盖 | API 覆盖 |
 |------|---------|---------|---------|
 | Config | 配置加载优先级 | ✅ 33 用例 | - |
-| SchemaManager | Schema 加载/验证/引用检查 | ✅ 54 用例 | ✅ 多级别 schema |
-| StorageManager | Parquet 写入/读取/压缩/文件锁 | ✅ 35 用例 | ✅ 多文件写入 |
-| IndexManager | 路径计算/分组/filter | ✅ 14 用例 | ✅ 跨文件写入 |
-| DataProcessor | 写入协调/读取/验证/重复检测 | ✅ 13 用例 | ✅ 数据完整性 |
+| SchemaManager | Schema 加载/验证/引用检查 | ✅ 54 用例 | ✅ schemas 端点 |
+| StorageManager | Parquet 写入/读取/压缩/文件锁 | ✅ 35 用例 | ✅ 跨文件写入 |
+| IndexManager | 路径计算/分组/filter | ✅ 14 用例 | ✅ GET 过滤 |
+| DataProcessor | 写入协调/读取/验证/重复检测 | ✅ 13 用例 | ✅ POST 自动去重 |
+| **RESTful API** | 显式路径 / GET / POST / PUT(关) / DELETE(关) / schemas / stats | ✅ 20 用例 | — |
 
-### 3.2 边界条件覆盖
+**总测试数**: 144 UT + 20 API = **164 全部通过**
+
+### 4.2 边界条件覆盖
 
 - 空 DataFrame / 空文件列表
 - 不存在的文件/目录/schema
@@ -260,8 +358,9 @@ data/stock_30min/2026/05/2026-05-15.parquet (99行)
 - 缺失必填字段/列
 - 重复数据检测
 - 文件不存在时 append 回退 overwrite
+- 未注册 schema 返回 JSON 404（非 HTML）
 
-### 3.3 并发安全
+### 4.3 并发安全
 
 - `fcntl.flock` 文件锁测试（LOCK_EX 写锁 / LOCK_SH 读锁）
 - 读写互斥验证
@@ -269,7 +368,7 @@ data/stock_30min/2026/05/2026-05-15.parquet (99行)
 
 ---
 
-## 四、Bug 修复记录
+## 五、Bug 修复记录
 
 | Bug | 发现时间 | 问题描述 | 修复方案 |
 |-----|---------|---------|---------|
@@ -277,10 +376,13 @@ data/stock_30min/2026/05/2026-05-15.parquet (99行)
 | _find_duplicates 硬编码主键 | 11:27 | 硬编码 `["date", "stock_code"]` 与 fixture 不匹配 | 动态从 schema.data_schema 提取主键字段 |
 | _render_glob_pattern 大小写问题 | 11:27 | 硬编码小写 year/month 与 schema 大写 Year/Month 不匹配 | 动态处理 placeholder，`field_name.lower()` 匹配 builtin |
 | read_data 不支持 dict 范围 filter | 11:41 | `{"start": ..., "end": ...}` 类型 filter 导致 NotImplementedError | 新增 dict 类型检查，使用 DataFrame 范围过滤 |
+| Flask endpoint 同名冲突 | 13:00 | 多 schema 共用 `get_data` 函数名，AssertionError | `_make_endpoint(prefix, data_type)` 生成唯一名称 |
+| conftest 路径少一层 dirname | 13:00 | `DATACENTER_SCHEMAS_DIR` 指向 `tests/schemas`，导致 API 测试 404 | 修正路径构造多加一层 `os.path.dirname` |
+| 未注册 schema 返回 HTML 404 | 13:02 | `/api/v1/nonexistent/schemas` 返回 HTML 而非 JSON | `@app.errorhandler(404)` 全局 JSON 响应 |
 
 ---
 
-## 五、Schema 文件
+## 六、Schema 文件
 
 ### 5.1 已定义 Schema
 
@@ -312,7 +414,7 @@ data/stock_30min/2026/05/2026-05-15.parquet (99行)
 
 ---
 
-## 六、结论
+## 七、结论
 
 **测试结果**: 全部通过
 
@@ -324,7 +426,7 @@ data/stock_30min/2026/05/2026-05-15.parquet (99行)
   - Filter 功能：✅
   - 数据完整性：✅
 
-**项目状态**: DataCenter 核心模块（Config / SchemaManager / StorageManager / IndexManager / DataProcessor）开发完成，测试覆盖充分，可进入下一阶段开发（API / Handler / Docker）。
+**项目状态**: RESTful API 层已完成，核心模块（144 UT）+ API 层（20 测试）共 164 个测试全部通过。可进入下一阶段（Docker 部署 / 数据采集集成）。
 
 ---
 

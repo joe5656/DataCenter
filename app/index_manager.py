@@ -22,8 +22,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import pandas as pd
 
-from app.config import Config
-from app.schema_manager import SchemaManager
+from DataCenter.app.config import Config
+from DataCenter.app.schema_manager import SchemaManager
 
 
 # Filter 值类型
@@ -189,8 +189,18 @@ class IndexManager:
         # 处理 date
         if "date" in filters:
             date_filter = filters["date"]
-            if isinstance(date_filter, dict) and "start" in date_filter:
-                dates = self._generate_date_range(date_filter["start"], date_filter["end"])
+            if isinstance(date_filter, dict) and ("start" in date_filter or "end" in date_filter):
+                start = date_filter.get("start")
+                end = date_filter.get("end")
+                if start and end:
+                    dates = self._generate_date_range(start, end)
+                elif start:
+                    from datetime import date as date_mod
+                    dates = self._generate_date_range(start, date_mod.today().strftime("%Y-%m-%d"))
+                elif end:
+                    dates = [None]
+                else:
+                    dates = []
             elif isinstance(date_filter, list):
                 dates = date_filter
             elif isinstance(date_filter, str):

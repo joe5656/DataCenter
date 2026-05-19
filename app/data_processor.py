@@ -20,10 +20,10 @@ REQ-003 接口适配：
 import pandas as pd
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.config import Config
-from app.index_manager import IndexManager
-from app.schema_manager import SchemaManager
-from app.storage_manager import StorageManager
+from DataCenter.app.config import Config
+from DataCenter.app.index_manager import IndexManager
+from DataCenter.app.schema_manager import SchemaManager
+from DataCenter.app.storage_manager import StorageManager
 
 
 class DataProcessor:
@@ -191,17 +191,35 @@ class DataProcessor:
         # 4. 应用 filters 过滤
         for key, value in filters.items():
             if key in result.columns:
-                if isinstance(value, dict) and "start" in value and "end" in value:
-                    # 范围过滤
-                    result = result[(result[key] >= value["start"]) & (result[key] <= value["end"])]
+                col_dtype = result[key].dtype
+                if isinstance(value, dict) and ("start" in value or "end" in value):
+                    # 范围过滤（支持开放式范围）
+                    if "start" in value:
+                        sv = self._coerce_filter_value(value["start"], col_dtype)
+                        result = result[result[key] >= sv]
+                    if "end" in value:
+                        ev = self._coerce_filter_value(value["end"], col_dtype)
+                        result = result[result[key] <= ev]
                 elif isinstance(value, list):
                     # 枚举过滤
-                    result = result[result[key].isin(value)]
+                    coerced = [self._coerce_filter_value(v, col_dtype) for v in value]
+                    result = result[result[key].isin(coerced)]
                 else:
                     # 单值过滤
-                    result = result[result[key] == value]
+                    cv = self._coerce_filter_value(value, col_dtype)
+                    result = result[result[key] == cv]
 
         return result
+
+    @staticmethod
+    def _coerce_filter_value(value, col_dtype):
+        """将 filter 值转换为与列 dtype 匹配的类型"""
+        if pd.api.types.is_numeric_dtype(col_dtype):
+            try:
+                return float(value)
+            except (ValueError, TypeError):
+                return value
+        return value
 
     def validate_schema(
         self, data: pd.DataFrame, data_type: str, version: str

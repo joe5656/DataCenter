@@ -1,0 +1,50 @@
+# ============================================================
+# Docker build context exclusion
+# 排除：测试、文档、本地缓存、构建产物、开发文件
+# ============================================================
+
+# 测试相关
+tests/
+CTtest/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+
+# Git
+.git/
+.gitignore
+
+# Docker 相关（本地文件，不要打进镜像）
+Dockerfile
+.dockerignore
+
+# 文档
+*.md
+
+# 本地开发文件
+memory/
+*.log
+*.bak
+*.tmp
+sessions/
+.consolidate-state.json
+baseOS-workflow.yaml
+run_api.py
+data-types.md
+test-report.md
+
+# 构建/安装
+build/
+dist/
+*.egg-info/
+setup.py
+
+# OpenClaw 工作区产物
+.consolidate-state.json
+baseOS-workflow.yaml
+
+# __pycache__（各级目录）
+__pycache__/
+*/__pycache__/
+*/*/__pycache__/
