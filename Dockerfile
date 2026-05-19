@@ -33,9 +33,11 @@ RUN pip3 install --break-system-packages --no-cache-dir -r /tmp/datacenter_requi
 COPY . /app/DataCenter/
 
 # ============================================================
-# 第 3 步：用 DataCenter 的 interface + handler 覆盖 base 的 demo
-# 覆盖后 DynamicLoader 会加载 DataCenter 定义的路由
+# 第 3 步：清除 base 残留的 interface/handler，再拷贝 DataCenter 的
+# base 自带的 demo 文件不再需要，先删再拷，避免残留干扰
 # ============================================================
+RUN rm -rf /app/restfulapi-interface/interfaces/* \
+    && rm -rf /app/restfulapi-interface/handlers/*
 COPY interfaces/ /app/restfulapi-interface/interfaces/
 COPY app/handlers/ /app/restfulapi-interface/handlers/
 

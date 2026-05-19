@@ -124,3 +124,36 @@ routes:
   - path: /api/v1/stock_1day/stats
     methods: [GET]
     handler: handler_factory:DataHandler
+
+  # ----------------------------------------------------------------
+  # index_constituents
+  # ----------------------------------------------------------------
+  - path: /api/v1/index_constituents
+    methods: [GET]
+    handler: handler_factory:DataHandler
+    description: "查询指数成分股数据"
+
+  - path: /api/v1/index_constituents
+    methods: [POST]
+    handler: handler_factory:DataHandler
+    description: "写入指数成分股数据"
+
+  - path: /api/v1/index_constituents
+    methods: [PUT]
+    handler: handler_factory:DataHandler
+    description: "全量覆盖指数成分股（受 ALLOW_PUT 控制）"
+
+  - path: /api/v1/index_constituents
+    methods: [DELETE]
+    handler: handler_factory:DataHandler
+    description: "删除指数成分股数据（受 ALLOW_DELETE 控制）"
+
+  - path: /api/v1/index_constituents/schemas
+    methods: [GET]
+    handler: handler_factory:DataHandler
+    description: "查询 index_constituents Schema 版本"
+
+  - path: /api/v1/index_constituents/stats
+    methods: [GET]
+    handler: handler_factory:DataHandler
+    description: "查询 index_constituents 存储统计"

@@ -1,0 +1,15 @@
+{
+    "name": "index_constituents",
+    "version": "v1",
+    "data_schema": {
+        "index_code": "string",
+        "index_name_en": "string",
+        "index_name_cn": "string",
+        "date": "string",
+        "Year": "string",
+        "Month": "string",
+        "stock_code": "string",
+        "stock_name": "string"
+    },
+    "storage_rule": "{schema.index_code}.parquet"
+}
