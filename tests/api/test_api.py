@@ -6,9 +6,30 @@ API Integration Tests - DataCenter RESTful API
 import os
 import sys
 import json
+import time
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+
+def _make_sample_record(offset_hours=0):
+    """创建测试记录，使用时间戳确保唯一性"""
+    ts = int(time.time()) + offset_hours * 3600
+    date_str = f"2099-{ts % 12 + 1:02d}-{ts % 28 + 1:02d}"
+    return {
+        "Year": date_str[:4],
+        "Month": date_str[5:7],
+        "date": date_str,
+        "time": f"{ts % 24:02d}:00",
+        "market": "XHKG",
+        "stock_code": "00700",
+        "stock_name": "腾讯控股",
+        "open": 500.0,
+        "close": 501.0,
+        "high": 502.0,
+        "low": 499.0,
+        "volume": 100000
+    }
 
 
 @pytest.fixture
@@ -171,59 +192,13 @@ class TestGetEndpoint:
 class TestPostEndpoint:
     """POST /api/v1/data/{data_type}"""
 
-    # 使用未来日期避免与现有测试数据冲突
-    SAMPLE_RECORD = {
-        "Year": "2030",
-        "Month": "01",
-        "date": "2030-01-01",
-        "time": "09:00",
-        "market": "XHKG",
-        "stock_code": "00700",
-        "stock_name": "腾讯控股",
-        "open": 500.0,
-        "close": 501.0,
-        "high": 502.0,
-        "low": 499.0,
-        "volume": 100000
-    }
-
-    SAMPLE_RECORDS = [
-        {
-            "Year": "2030",
-            "Month": "01",
-            "date": "2030-01-02",
-            "time": "09:00",
-            "market": "XHKG",
-            "stock_code": "00700",
-            "stock_name": "腾讯控股",
-            "open": 500.0,
-            "close": 501.0,
-            "high": 502.0,
-            "low": 499.0,
-            "volume": 100000
-        },
-        {
-            "Year": "2030",
-            "Month": "01",
-            "date": "2030-01-02",
-            "time": "09:05",
-            "market": "XHKG",
-            "stock_code": "00700",
-            "stock_name": "腾讯控股",
-            "open": 501.0,
-            "close": 502.0,
-            "high": 503.0,
-            "low": 500.0,
-            "volume": 110000
-        }
-    ]
-
     def test_post_success(self, client, api_base):
+        sample = _make_sample_record()
         rv = client.post(
             f'{api_base}/stock_5min',
             json={
                 "version": "v1",
-                "data": [self.SAMPLE_RECORD]
+                "data": [sample]
             },
             content_type='application/json'
         )
@@ -255,7 +230,7 @@ class TestPostEndpoint:
     def test_post_schema_not_found(self, client, api_base):
         rv = client.post(
             f'{api_base}/nonexistent_type',
-            json={"version": "v1", "data": [self.SAMPLE_RECORD]},
+            json={"version": "v1", "data": [_make_sample_record()]},
             content_type='application/json'
         )
         assert rv.status_code == 404
@@ -377,40 +352,12 @@ class TestErrorHandling:
 
     def test_post_multiple_records(self, client, api_base):
         """POST 多条记录"""
+        records = [_make_sample_record(i) for i in range(2)]
         rv = client.post(
             f'{api_base}/stock_5min',
             json={
                 "version": "v1",
-                "data": [
-                    {
-                        "Year": "2030",
-                        "Month": "01",
-                        "date": "2030-01-03",
-                        "time": "10:00",
-                        "market": "XHKG",
-                        "stock_code": "00700",
-                        "stock_name": "腾讯控股",
-                        "open": 500.0,
-                        "close": 501.0,
-                        "high": 502.0,
-                        "low": 499.0,
-                        "volume": 100000
-                    },
-                    {
-                        "Year": "2030",
-                        "Month": "01",
-                        "date": "2030-01-03",
-                        "time": "10:05",
-                        "market": "XHKG",
-                        "stock_code": "00700",
-                        "stock_name": "腾讯控股",
-                        "open": 501.0,
-                        "close": 502.0,
-                        "high": 503.0,
-                        "low": 500.0,
-                        "volume": 110000
-                    }
-                ]
+                "data": records
             },
             content_type='application/json'
         )
