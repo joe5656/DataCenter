@@ -310,3 +310,110 @@ class TestValidateSchema:
         is_valid, errors = data_processor.validate_schema(df, "stock_5min", "v1")
         assert is_valid is False
         assert len(errors) > 0
+
+
+# ------------------------------------------------------------------ #
+# 测试空数据和过滤
+# ------------------------------------------------------------------ #
+
+class TestEdgeCases:
+    """边界情况测试"""
+
+    def test_write_empty_dataframe(self, data_processor):
+        """写入空 DataFrame"""
+        df = pd.DataFrame()
+        result = data_processor.write_data(df, "stock_5min", "v1")
+        assert result["success"] is True
+        assert result["total_rows"] == 0
+        assert result["files_written"] == 0
+
+    def test_read_with_date_range_filter(self, data_processor):
+        """日期范围过滤"""
+        # 先写入数据
+        df = pd.DataFrame({
+            "date": ["2026-05-17", "2026-05-18", "2026-05-19"],
+            "code": ["00700"] * 3,
+            "market": ["XHKG"] * 3,
+            "time": ["09:30"] * 3,
+            "open": [380.0, 381.0, 382.0],
+        })
+        data_processor.write_data(df, "stock_5min", "v1")
+
+        # 范围过滤
+        df_read = data_processor.read_data(
+            data_type="stock_5min",
+            version="v1",
+            date={"start": "2026-05-18", "end": "2026-05-18"},
+        )
+
+        assert len(df_read) == 1
+        assert df_read.iloc[0]["date"] == "2026-05-18"
+
+    def test_read_with_open_range_filter(self, data_processor):
+        """开放式范围过滤（只有 start 或只有 end）"""
+        df = pd.DataFrame({
+            "date": ["2026-05-17", "2026-05-18", "2026-05-19"],
+            "code": ["00700"] * 3,
+            "market": ["XHKG"] * 3,
+            "time": ["09:30"] * 3,
+            "open": [380.0, 381.0, 382.0],
+        })
+        data_processor.write_data(df, "stock_5min", "v1")
+
+        # 只有 start
+        df_read = data_processor.read_data(
+            data_type="stock_5min",
+            version="v1",
+            date={"start": "2026-05-18"},
+        )
+        assert len(df_read) == 2  # 18 和 19
+
+    def test_read_with_list_filter(self, data_processor):
+        """枚举过滤（列表）"""
+        df = pd.DataFrame({
+            "date": ["2026-05-17", "2026-05-17"],
+            "code": ["00700", "00701"],
+            "market": ["XHKG", "XHKG"],
+            "time": ["09:30", "09:30"],
+            "open": [380.0, 381.0],
+        })
+        data_processor.write_data(df, "stock_5min", "v1")
+
+        # 枚举过滤
+        df_read = data_processor.read_data(
+            data_type="stock_5min",
+            version="v1",
+            date="2026-05-17",
+            code=["00700", "00702"],  # 只有 00700 存在
+        )
+        assert len(df_read) == 1
+        assert df_read.iloc[0]["code"] == "00700"
+
+    def test_read_empty_result(self, data_processor):
+        """读取不存在的范围返回空"""
+        df = data_processor.read_data(
+            data_type="stock_5min",
+            version="v1",
+            date="2099-12-31",  # 不存在的日期
+        )
+        assert df.empty
+
+    def test_coerce_filter_value_numeric(self, data_processor):
+        """_coerce_filter_value 数值类型转换"""
+        # 这个通过 read_data 的数值过滤间接测试
+        df = pd.DataFrame({
+            "date": ["2026-05-17"],
+            "code": ["00700"],
+            "market": ["XHKG"],
+            "time": ["09:30"],
+            "open": [380.0],
+        })
+        data_processor.write_data(df, "stock_5min", "v1")
+
+        # open 是 double 类型，过滤值会被转为 float
+        df_read = data_processor.read_data(
+            data_type="stock_5min",
+            version="v1",
+            open={"start": 379.0, "end": 381.0},
+        )
+        assert len(df_read) == 1

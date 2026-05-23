@@ -269,3 +269,117 @@ class TestEdgeCases:
 
         with pytest.raises(ValueError, match="missing required columns"):
             index_manager.get_write_paths(df, "stock_5min", "v1")
+
+    def test_write_empty_dataframe(self, index_manager):
+        """写入空 DataFrame 返回空字典"""
+        df = pd.DataFrame()
+        result = index_manager.get_write_paths(df, "stock_5min", "v1")
+        assert result == {}
+
+    def test_write_single_group(self, index_manager):
+        """单值 groupby"""
+        df = pd.DataFrame({
+            "date": ["2026-05-17"],
+            "code": ["00700"],
+            "market": ["XHKG"],
+            "time": ["09:30"],
+            "open": [380.0],
+        })
+        result = index_manager.get_write_paths(df, "stock_5min", "v1")
+        assert len(result) == 1
+
+    def test_extract_path_refs(self, index_manager):
+        """提取路径引用"""
+        refs = index_manager._extract_path_refs(
+            "{schema.name}/{schema.market}/{schema.date}.parquet"
+        )
+        assert "market" in refs
+        assert "date" in refs
+
+    def test_render_path_with_year_month(self, index_manager):
+        """测试 year/month 从 date 提取"""
+        path = index_manager._render_path(
+            "{schema.name}/{schema.year}/{schema.month}/{schema.date}.parquet",
+            {},
+            "stock_5min",
+            "v1",
+            {"date": "2026-05-17"}
+        )
+        assert "2026" in path
+        assert "05" in path
+
+    def test_render_path_with_data_row(self, index_manager):
+        """测试 data_row 参数"""
+        path = index_manager._render_path(
+            "{schema.name}/{schema.code}.parquet",
+            {},
+            "stock_5min",
+            "v1",
+            {"code": "00700"}
+        )
+        assert "00700" in path
+
+    def test_generate_date_range(self, index_manager):
+        """生成日期范围"""
+        dates = index_manager._generate_date_range("2026-05-15", "2026-05-18")
+        assert len(dates) == 4
+        assert "2026-05-15" in dates
+        assert "2026-05-18" in dates
+
+    def test_generate_date_range_single(self, index_manager):
+        """生成单日日期范围"""
+        dates = index_manager._generate_date_range("2026-05-15", "2026-05-15")
+        assert len(dates) == 1
+
+    def test_generate_candidate_patterns_no_filters(self, index_manager):
+        """无 filter 时生成通配符模式"""
+        patterns = index_manager._generate_candidate_patterns(
+            "{schema.name}/{schema.date}.parquet",
+            "stock_1day",
+            "v1",
+            {}
+        )
+        assert len(patterns) == 1
+        assert "*" in patterns[0]
+
+    def test_render_glob_pattern(self, index_manager):
+        """测试 glob 模式渲染"""
+        pattern = index_manager._render_glob_pattern(
+            "{schema.name}/{schema.date}.parquet",
+            "stock_1day",
+            "v1",
+            {"date": "2026-05-17"}
+        )
+        assert "stock_1day" in pattern
+        assert "2026-05-17" in pattern
+
+    def test_to_absolute_path(self, tmp_path, monkeypatch):
+        """测试绝对路径转换"""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir(exist_ok=True)
+
+        # 创建 schema
+        import json
+        d = tmp_path / "schemas"
+        d.mkdir(exist_ok=True)
+        stock_1day = {
+            "name": "stock_1day",
+            "version": "v1",
+            "data_schema": {"date": "string"},
+            "storage_rule": "{schema.name}/{schema.date}.parquet",
+        }
+        (d / "stock_1day_v1.json").write_text(json.dumps(stock_1day))
+
+        monkeypatch.setenv("DATACENTER_DATA_DIR", str(data_dir))
+
+        from app.schema_manager import SchemaManager
+        from app.index_manager import IndexManager
+
+        sm = SchemaManager(str(d))
+        im = IndexManager(sm)
+
+        rel_path = "stock_1day/2026-05-17.parquet"
+        abs_path = im.to_absolute_path(rel_path)
+
+        assert abs_path.startswith(str(data_dir))
+        assert rel_path in abs_path
